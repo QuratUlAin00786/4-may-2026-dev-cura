@@ -2814,6 +2814,52 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
     );
   }
 
+  // Family hierarchy: group by userId, show Self as the "main" patient then nest relatives under it.
+  const relationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  const patientGroups = (() => {
+    const map = new Map<number | string, any[]>();
+    for (const p of displayPatients) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = relationRank(a?.relation) - relationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main = sorted.find((m) => String(m?.relation ?? "").toLowerCase() === "self") ?? sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  })();
+
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center">
@@ -2848,6 +2894,9 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                       Full Name
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[10%] min-w-0">
+                      Relation
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[10%] min-w-0">
                       DOB
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[11%] min-w-0">
@@ -2878,6 +2927,9 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                       </td>
                       <td className="px-4 py-3">
                         <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-1/2"></div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-1/3"></div>
                       </td>
                       <td className="px-4 py-3">
                         <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-1/3"></div>
@@ -2964,6 +3016,9 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                     Full Name
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[10%] min-w-0">
+                    Relation
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[10%] min-w-0">
                     DOB
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[11%] min-w-0">
@@ -2987,17 +3042,28 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {displayPatients.map((patient: any) => (
-                  <tr 
-                    key={patient.id} 
-                    className="hover:bg-gray-50 dark:hover:bg-gray-900 transition-colors"
-                    data-testid={`row-patient-${patient.id}`}
-                  >
+                {patientGroups.flatMap(({ main, relatives }) => {
+                  const rows = [
+                    { patient: main, isChild: false },
+                    ...relatives.map((p) => ({ patient: p, isChild: true })),
+                  ];
+
+                  return rows.map(({ patient, isChild }) => (
+                    <tr 
+                      key={patient.id} 
+                      className={`transition-colors ${isChild ? "bg-gray-50/40 dark:bg-gray-900/20" : ""} hover:bg-gray-50 dark:hover:bg-gray-900`}
+                      data-testid={`row-patient-${patient.id}`}
+                    >
                     <td className="px-4 py-3 text-sm text-gray-900 dark:text-gray-100 max-w-0">
                       <div className="truncate" title={patient.patientId}>{patient.patientId}</div>
                     </td>
                     <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-gray-100 max-w-0">
                       <div className="flex items-center gap-2 min-w-0">
+                        {isChild && (
+                          <span className="text-gray-400 dark:text-gray-500 flex-shrink-0" aria-hidden="true">
+                            ↳
+                          </span>
+                        )}
                         <span className="truncate" title={`${patient.firstName} ${patient.lastName}`.trim()}>
                           {patient.firstName} {patient.lastName}
                         </span>
@@ -3013,6 +3079,11 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                             </Tooltip>
                           </TooltipProvider>
                         )}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-300 max-w-0">
+                      <div className="truncate" title={patient.relation || ""}>
+                        {patient.relation || "-"}
                       </div>
                     </td>
                     <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-300 max-w-0">
@@ -3162,14 +3233,16 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                       </div>
                     </td>
                   </tr>
-                ))}
+                  ));
+                })}
               </tbody>
             </table>
           </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4 md:gap-5 min-w-0 w-full">
-          {displayPatients.map((patient: any) => {
+          {patientGroups.map(({ main, relatives }) => {
+            const patient = main;
             return (
               <Card
                 key={patient.id}
@@ -3361,6 +3434,34 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                       <div className="flex items-center min-w-0 text-neutral-600 dark:text-neutral-300">
                         <User className="h-3.5 w-3.5 sm:h-4 sm:w-4 mr-1.5 flex-shrink-0" />
                         <span className="truncate">Gender: {patient.genderAtBirth}</span>
+                      </div>
+                    )}
+                    {patient.relation && (
+                      <div className="flex items-center min-w-0 text-neutral-600 dark:text-neutral-300">
+                        <User className="h-3.5 w-3.5 sm:h-4 sm:w-4 mr-1.5 flex-shrink-0" />
+                        <span className="truncate">Relation: {patient.relation}</span>
+                      </div>
+                    )}
+                    {relatives.length > 0 && (
+                      <div className="space-y-1">
+                        <p className="text-[10px] sm:text-xs font-medium text-neutral-700 dark:text-neutral-300">
+                          Family Members
+                        </p>
+                        <div className="space-y-1">
+                          {relatives.slice(0, 4).map((m: any) => (
+                            <div key={m.id} className="flex items-center gap-2 min-w-0 text-neutral-600 dark:text-neutral-300">
+                              <span className="text-gray-400 dark:text-gray-500 flex-shrink-0" aria-hidden="true">↳</span>
+                              <span className="truncate">
+                                {(m.relation || "Other")}: {m.firstName} {m.lastName}
+                              </span>
+                            </div>
+                          ))}
+                          {relatives.length > 4 && (
+                            <div className="text-[10px] sm:text-xs text-neutral-500 dark:text-neutral-400">
+                              +{relatives.length - 4} more
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                     {patient.address?.postcode && (

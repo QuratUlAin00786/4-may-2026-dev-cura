@@ -405,6 +405,7 @@ export const patients = pgTable("patients", {
   patientId: text("patient_id").notNull(), // Custom patient ID per organization
   firstName: text("first_name").notNull(),
   lastName: text("last_name").notNull(),
+  relation: varchar("relation", { length: 20 }), // Self, Father, Mother, Son, Daughter, Spouse, Other
   dateOfBirth: date("date_of_birth", { mode: 'string' }),
   genderAtBirth: varchar("gender_at_birth", { length: 20 }),
   email: text("email"),
@@ -2692,6 +2693,7 @@ export const insertPatientSchema = createInsertSchema(patients).omit({
   firstName: z.string().trim().min(1, "First name is required"),
   lastName: z.string().trim().min(1, "Last name is required"),
   patientId: z.string().trim().min(1, "Patient ID is required"),
+  relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
   dateOfBirth: z.coerce.date().nullable().optional(),
   email: z.string().trim().email("Please enter a valid email address").optional().or(z.literal("")),
   phone: z.string().trim().optional(),

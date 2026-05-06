@@ -15,6 +15,8 @@ import { Calendar as CalendarComponent } from "@/components/ui/calendar";
 import { Calendar, Clock, MapPin, User, Users, Video, Stethoscope, FileText, Plus, Save, X, Mic, Square, Edit, Trash2, Receipt, ExternalLink, PoundSterling } from "lucide-react";
 import { format, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, isToday, startOfWeek, endOfWeek } from "date-fns";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Switch } from "@/components/ui/switch";
 
 const anatomicalDiagramImage = "/anatomical-diagram-clean.svg";
 const facialDiagramImage = "/clean-facial-diagram.png";
@@ -1633,6 +1635,196 @@ Medical License: [License Number]
     },
   });
 
+  const getPatientRelation = (patient: any): string => {
+    const rel = String(patient?.relation ?? "").trim();
+    return rel || "Self";
+  };
+
+  const getSelfEmailForUserId = (userId: number | string | null | undefined): string => {
+    if (!patientsData || !Array.isArray(patientsData) || userId == null) return "";
+    const self = patientsData.find((p: any) => String(p?.userId) === String(userId) && String(p?.relation ?? "").toLowerCase() === "self");
+    return String(self?.email ?? "").trim();
+  };
+
+  const getDisplayEmailForPatient = (patient: any): string => {
+    const relation = String(patient?.relation ?? "").toLowerCase();
+    const email = String(patient?.email ?? "").trim();
+    if (relation === "self") return email;
+    // For non-self family members, display Self email for the same userId
+    return getSelfEmailForUserId(patient?.userId) || email;
+  };
+
+  const patientRelationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  const patientDropdownGroups = (() => {
+    if (!patientsData || !Array.isArray(patientsData)) return [];
+    const map = new Map<number | string, any[]>();
+    for (const p of patientsData) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main = sorted.find((m) => String(m?.relation ?? "").toLowerCase() === "self") ?? sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  })();
+
+  const [showAddTreatmentDialog, setShowAddTreatmentDialog] = useState(false);
+  const [bulkTreatmentSelections, setBulkTreatmentSelections] = useState<Record<string, { selected: boolean; price: string }>>({});
+  const [bulkDefaultPrice, setBulkDefaultPrice] = useState("");
+  const [isSavingTreatment, setIsSavingTreatment] = useState(false);
+  const [treatmentError, setTreatmentError] = useState("");
+
+  const [treatmentForm, setTreatmentForm] = useState<{
+    doctorRole: string;
+    doctorName: string;
+    doctorId: number | null;
+  }>({
+    doctorRole: "",
+    doctorName: "",
+    doctorId: null,
+  });
+
+  const { data: treatmentsInfoList = [], isLoading: loadingTreatmentsInfo } = useQuery<any[]>({
+    queryKey: ["/api/treatments-info"],
+    staleTime: 60000,
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/treatments-info");
+      const data = await res.json();
+      return Array.isArray(data) ? data : [];
+    },
+    enabled: showNewAppointment, // only needed while creating appointments
+  });
+
+  const openAddTreatmentsPopup = () => {
+    const providerIdNum = selectedProviderId ? parseInt(String(selectedProviderId), 10) : NaN;
+    const provider = Array.isArray(filteredUsers)
+      ? filteredUsers.find((u: any) => String(u?.id) === String(selectedProviderId))
+      : null;
+
+    setTreatmentError("");
+    setBulkDefaultPrice("");
+    setBulkTreatmentSelections({});
+    setTreatmentForm({
+      doctorRole: selectedRole || "",
+      doctorName: provider ? `${provider.firstName} ${provider.lastName}` : "",
+      doctorId: Number.isNaN(providerIdNum) ? null : providerIdNum,
+    });
+    setShowAddTreatmentDialog(true);
+  };
+
+  const handleBulkTreatmentSave = async () => {
+    if (!treatmentForm.doctorId) {
+      setTreatmentError("Please select a role and name first.");
+      return;
+    }
+    const selected = Object.entries(bulkTreatmentSelections).filter(([, v]) => v.selected && v.price.trim() !== "");
+    if (selected.length === 0) {
+      setTreatmentError("Select at least one treatment and enter a price for each.");
+      return;
+    }
+    const invalid = selected.filter(([, v]) => Number.isNaN(parseFloat(v.price)) || parseFloat(v.price) < 0);
+    if (invalid.length > 0) {
+      setTreatmentError("All selected treatments must have a valid price (number ≥ 0).");
+      return;
+    }
+
+    setTreatmentError("");
+    setIsSavingTreatment(true);
+    try {
+      // fetch fresh treatments so we can avoid duplicates for that doctor
+      const freshRes = await apiRequest("GET", "/api/pricing/treatments");
+      const fresh = await freshRes.json();
+      const treatmentsToCheck: any[] = Array.isArray(fresh) ? fresh : [];
+
+      const doctorIdNorm = treatmentForm.doctorId ?? null;
+      const doctorNameNorm = String(treatmentForm.doctorName ?? "").trim().toLowerCase();
+      const doctorRoleNorm = String(treatmentForm.doctorRole ?? "").trim().toLowerCase();
+      const isSameDoctor = (t: any) => {
+        if (doctorIdNorm != null && t?.doctorId != null) return Number(t.doctorId) === Number(doctorIdNorm);
+        return (
+          String(t?.doctorName ?? "").trim().toLowerCase() === doctorNameNorm &&
+          String(t?.doctorRole ?? "").trim().toLowerCase() === doctorRoleNorm
+        );
+      };
+      const existingNamesForDoctor = new Set(
+        treatmentsToCheck.filter(isSameDoctor).map((t: any) => String(t?.name ?? "").trim().toLowerCase())
+      );
+
+      let addedCount = 0;
+      let skippedCount = 0;
+      for (const [infoId, { price }] of selected) {
+        const info = (treatmentsInfoList || []).find((i: any) => String(i?.id) === String(infoId));
+        if (!info) continue;
+        const nameKey = String(info?.name ?? "").trim().toLowerCase();
+        if (existingNamesForDoctor.has(nameKey)) {
+          skippedCount += 1;
+          continue;
+        }
+        const payload: any = {
+          name: String(info.name ?? "").trim(),
+          basePrice: price.trim(),
+          colorCode: info.colorCode || "#000000",
+          doctorRole: treatmentForm.doctorRole || null,
+          doctorName: treatmentForm.doctorName || null,
+          doctorId: treatmentForm.doctorId,
+          currency: currencyCodeForTreatments,
+        };
+        await apiRequest("POST", "/api/pricing/treatments", payload);
+        addedCount += 1;
+        existingNamesForDoctor.add(nameKey);
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["/api/pricing/treatments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/pricing/treatments"] });
+      setShowAddTreatmentDialog(false);
+      setBulkTreatmentSelections({});
+      toast({
+        title: "Treatments updated",
+        description:
+          addedCount === 0 && skippedCount > 0
+            ? "All selected treatments already exist. No new treatments were added."
+            : `${addedCount} treatment${addedCount !== 1 ? "s" : ""} added.${skippedCount ? ` ${skippedCount} skipped (already existed).` : ""}`,
+      });
+    } catch (err: any) {
+      setTreatmentError(err?.message || "Failed to add treatments.");
+      toast({ title: "Error", description: err?.message || "Failed to add treatments.", variant: "destructive" });
+    } finally {
+      setIsSavingTreatment(false);
+    }
+  };
+
   // Fetch roles from the roles table filtered by organization_id
   const { data: rolesData = [] } = useQuery({
     queryKey: ["/api/roles"],
@@ -1685,6 +1877,11 @@ Medical License: [License Number]
     },
   });
 
+  const currencyCodeForTreatments =
+    Array.isArray(treatmentsList) && treatmentsList.length > 0
+      ? String((treatmentsList[0] as any)?.currency ?? "GBP")
+      : "GBP";
+
   const { data: consultationServices = [], isLoading: isConsultationsLoading } = useQuery({
     queryKey: ["/api/pricing/doctors-fees"],
     enabled: showNewAppointment || user?.role === "admin",
@@ -1700,6 +1897,101 @@ Medical License: [License Number]
       }
     },
   });
+
+  const currencyCodeForConsultations =
+    Array.isArray(consultationServices) && consultationServices.length > 0
+      ? String((consultationServices[0] as any)?.currency ?? "GBP")
+      : "GBP";
+
+  const [showAddConsultationDialog, setShowAddConsultationDialog] = useState(false);
+  const [isSavingConsultations, setIsSavingConsultations] = useState(false);
+  const [consultationError, setConsultationError] = useState("");
+  const [consultationActive, setConsultationActive] = useState(true);
+  const [consultationForm, setConsultationForm] = useState<{
+    doctorRole: string;
+    doctorName: string;
+    doctorId: number | null;
+  }>({ doctorRole: "", doctorName: "", doctorId: null });
+
+  const [multipleConsultationServices, setMultipleConsultationServices] = useState<
+    Array<{ serviceName: string; serviceCode: string; category: string; basePrice: string }>
+  >([{ serviceName: "", serviceCode: "", category: "", basePrice: "" }]);
+
+  const openAddConsultationsPopup = () => {
+    const providerIdNum = selectedProviderId ? parseInt(String(selectedProviderId), 10) : NaN;
+    const provider = Array.isArray(filteredUsers)
+      ? filteredUsers.find((u: any) => String(u?.id) === String(selectedProviderId))
+      : null;
+
+    setConsultationError("");
+    setConsultationActive(true);
+    setMultipleConsultationServices([{ serviceName: "", serviceCode: "", category: "", basePrice: "" }]);
+    setConsultationForm({
+      doctorRole: selectedRole || "",
+      doctorName: provider ? `${provider.firstName} ${provider.lastName}` : "",
+      doctorId: Number.isNaN(providerIdNum) ? null : providerIdNum,
+    });
+    setShowAddConsultationDialog(true);
+  };
+
+  const handleSaveConsultations = async () => {
+    if (!consultationForm.doctorId) {
+      setConsultationError("Please select a role and name first.");
+      return;
+    }
+
+    const validServices = multipleConsultationServices.filter(
+      (s) => String(s.serviceName || "").trim() && String(s.basePrice || "").trim(),
+    );
+    if (validServices.length === 0) {
+      setConsultationError("Please add at least one service with name and price.");
+      return;
+    }
+
+    const invalid = validServices.filter((s) => Number.isNaN(parseFloat(s.basePrice)) || parseFloat(s.basePrice) < 0);
+    if (invalid.length > 0) {
+      setConsultationError("All services must have a valid price (number ≥ 0).");
+      return;
+    }
+
+    setConsultationError("");
+    setIsSavingConsultations(true);
+    try {
+      // Optional duplicate check (same endpoint used in Billing)
+      try {
+        const body = { serviceNames: validServices.map((s) => String(s.serviceName || "").trim()), doctorId: consultationForm.doctorId };
+        await apiRequest("POST", "/api/pricing/doctors-fees/check-duplicates", body as any);
+      } catch {
+        // ignore; backend may not enforce here
+      }
+
+      for (const service of validServices) {
+        const payload: any = {
+          serviceName: String(service.serviceName || "").trim(),
+          serviceCode: String(service.serviceCode || "").trim() || null,
+          category: String(service.category || "").trim() || null,
+          doctorId: consultationForm.doctorId,
+          doctorName: consultationForm.doctorName,
+          doctorRole: consultationForm.doctorRole,
+          basePrice: parseFloat(service.basePrice) || 0,
+          isActive: !!consultationActive,
+          currency: currencyCodeForConsultations,
+          version: 1,
+        };
+        await apiRequest("POST", "/api/pricing/doctors-fees", payload);
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["/api/pricing/doctors-fees"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/pricing/doctors-fees"] });
+      setShowAddConsultationDialog(false);
+      toast({ title: "Doctor fees added", description: `${validServices.length} service(s) added successfully.` });
+    } catch (err: any) {
+      setConsultationError(err?.message || "Failed to add doctor fees.");
+      toast({ title: "Error", description: err?.message || "Failed to add doctor fees.", variant: "destructive" });
+    } finally {
+      setIsSavingConsultations(false);
+    }
+  };
 
   const treatmentsMap = useMemo(() => {
     const map = new Map<number, { color: string; name: string }>();
@@ -4275,6 +4567,23 @@ Medical License: [License Number]
                                   </CommandItem>
                                 )}
                                 <CommandEmpty>No treatments found.</CommandEmpty>
+                                {!isTreatmentsLoading &&
+                                  filteredTreatmentsForSelection.length === 0 &&
+                                  selectedRole &&
+                                  selectedProviderId && (
+                                    <div className="px-3 py-2 border-t border-gray-100 dark:border-gray-700">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setOpenTreatmentCombo(false);
+                                          openAddTreatmentsPopup();
+                                        }}
+                                        className="text-sm text-blue-600 hover:text-blue-700 underline"
+                                      >
+                                        Add new treatments for this role and name
+                                      </button>
+                                    </div>
+                                  )}
                                 <CommandGroup>
                                     {filteredTreatmentsForSelection.map((treatment: any) => (
                                     <CommandItem
@@ -4303,6 +4612,16 @@ Medical License: [License Number]
                             </Command>
                           </PopoverContent>
                         </Popover>
+                        {selectedRole && selectedProviderId && (
+                          <button
+                            type="button"
+                            onClick={() => openAddTreatmentsPopup()}
+                            className="mt-2 text-sm text-blue-600 hover:text-blue-700 underline"
+                            data-testid="link-add-treatments"
+                          >
+                            Add new treatments for this role and name
+                          </button>
+                        )}
                         {appointmentSelectedTreatment && (
                           <Button
                             variant="ghost"
@@ -4345,6 +4664,23 @@ Medical License: [License Number]
                                   </CommandItem>
                                 )}
                                 <CommandEmpty>No consultations found.</CommandEmpty>
+                                {!isConsultationsLoading &&
+                                  filteredConsultationsForSelection.length === 0 &&
+                                  selectedRole &&
+                                  selectedProviderId && (
+                                    <div className="px-3 py-2 border-t border-gray-100 dark:border-gray-700">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setOpenConsultationCombo(false);
+                                          openAddConsultationsPopup();
+                                        }}
+                                        className="text-sm text-blue-600 hover:text-blue-700 underline"
+                                      >
+                                        Add new consultations for this role and name
+                                      </button>
+                                    </div>
+                                  )}
                                 <CommandGroup>
                                   {filteredConsultationsForSelection.map((service: any) => (
                                     <CommandItem
@@ -4369,6 +4705,16 @@ Medical License: [License Number]
                             </Command>
                           </PopoverContent>
                         </Popover>
+                        {selectedRole && selectedProviderId && (
+                          <button
+                            type="button"
+                            onClick={() => openAddConsultationsPopup()}
+                            className="mt-2 text-sm text-blue-600 hover:text-blue-700 underline"
+                            data-testid="link-add-consultations"
+                          >
+                            Add new consultations for this role and name
+                          </button>
+                        )}
                         {appointmentSelectedConsultation && (
                           <Button
                             variant="ghost"
@@ -4415,24 +4761,33 @@ Medical License: [License Number]
                           <CommandList>
                             <CommandEmpty>No patient found.</CommandEmpty>
                             <CommandGroup>
-                              {patientsData && patientsData.map((patient: any) => (
-                                <CommandItem
-                                  key={patient.id}
-                                  value={`${patient.firstName} ${patient.lastName} ${patient.patientId}`}
-                                  onSelect={() => {
-                                    setNewAppointmentData({ ...newAppointmentData, patientId: patient.id.toString() });
-                                    setPatientError(""); // Clear error when patient is selected
-                                    setOpenPatientCombo(false);
-                                  }}
-                                >
-                                  <Check
-                                    className={`mr-2 h-4 w-4 ${
-                                      newAppointmentData.patientId === patient.id.toString() ? "opacity-100" : "opacity-0"
-                                    }`}
-                                  />
-                                  {patient.firstName} {patient.lastName} ({patient.patientId})
-                                </CommandItem>
-                              ))}
+                              {patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                const rows = [
+                                  { patient: main, isChild: false },
+                                  ...relatives.map((p) => ({ patient: p, isChild: true })),
+                                ];
+                                return rows.map(({ patient, isChild }) => (
+                                  <CommandItem
+                                    key={patient.id}
+                                    value={`${patient.firstName} ${patient.lastName} ${patient.patientId}`}
+                                    onSelect={() => {
+                                      setNewAppointmentData({ ...newAppointmentData, patientId: patient.id.toString() });
+                                      setPatientError(""); // Clear error when patient is selected
+                                      setOpenPatientCombo(false);
+                                    }}
+                                  >
+                                    <Check
+                                      className={`mr-2 h-4 w-4 ${
+                                        newAppointmentData.patientId === patient.id.toString() ? "opacity-100" : "opacity-0"
+                                      }`}
+                                    />
+                                    <span className="truncate">
+                                      {isChild ? "↳ " : ""}
+                                      {patient.firstName} {patient.lastName} ({patient.patientId})
+                                    </span>
+                                  </CommandItem>
+                                ));
+                              })}
                             </CommandGroup>
                           </CommandList>
                         </Command>
@@ -4441,6 +4796,26 @@ Medical License: [License Number]
                     {patientError && (
                       <p className="text-red-500 text-sm mt-1">{patientError}</p>
                     )}
+                    {newAppointmentData.patientId && patientsData && (() => {
+                      const selectedPatient = patientsData.find((p: any) => p.id.toString() === newAppointmentData.patientId);
+                      if (!selectedPatient) return null;
+                      const email = getDisplayEmailForPatient(selectedPatient);
+                      const relation = getPatientRelation(selectedPatient);
+                      return (
+                        <div className="mt-2 rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-slate-900/40 p-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs text-gray-600 dark:text-gray-300 truncate">
+                                <span className="font-medium">Email:</span> {email || "-"}
+                              </p>
+                            </div>
+                            <Badge variant="secondary" className="flex-shrink-0">
+                              {relation}
+                            </Badge>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                   <div>
                     <Label className="text-sm font-medium text-gray-600 flex items-center gap-2">
@@ -4580,13 +4955,40 @@ Medical License: [License Number]
                         <SelectValue placeholder="Select a patient" />
                       </SelectTrigger>
                       <SelectContent>
-                        {patientsData && patientsData.map((patient: any) => (
-                          <SelectItem key={patient.id} value={patient.id.toString()}>
-                            {patient.firstName} {patient.lastName} ({patient.patientId})
-                          </SelectItem>
-                        ))}
+                        {patientDropdownGroups.flatMap(({ main, relatives }) => {
+                          const rows = [
+                            { patient: main, isChild: false },
+                            ...relatives.map((p) => ({ patient: p, isChild: true })),
+                          ];
+                          return rows.map(({ patient, isChild }) => (
+                            <SelectItem key={patient.id} value={patient.id.toString()}>
+                              {isChild ? "↳ " : ""}
+                              {patient.firstName} {patient.lastName} ({patient.patientId})
+                            </SelectItem>
+                          ));
+                        })}
                       </SelectContent>
                     </Select>
+                    {newAppointmentData.patientId && patientsData && (() => {
+                      const selectedPatient = patientsData.find((p: any) => p.id.toString() === newAppointmentData.patientId);
+                      if (!selectedPatient) return null;
+                      const email = getDisplayEmailForPatient(selectedPatient);
+                      const relation = getPatientRelation(selectedPatient);
+                      return (
+                        <div className="mt-2 rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-slate-900/40 p-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs text-gray-600 dark:text-gray-300 truncate">
+                                <span className="font-medium">Email:</span> {email || "-"}
+                              </p>
+                            </div>
+                            <Badge variant="secondary" className="flex-shrink-0">
+                              {relation}
+                            </Badge>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   {/* Role and Name Selection Row */}
@@ -5036,6 +5438,317 @@ Medical License: [License Number]
         </DialogContent>
       </Dialog>
 
+      {/* Add Treatment (Bulk) Dialog - reused from Billing */}
+      <Dialog open={showAddTreatmentDialog} onOpenChange={setShowAddTreatmentDialog}>
+        <DialogContent className="max-w-lg max-h-[90vh] flex flex-col dark:border-gray-700 dark:bg-slate-800">
+          <DialogHeader>
+            <DialogTitle>Add Treatment</DialogTitle>
+            <DialogDescription>
+              Select one or more treatments, set prices (or apply a default price), then add them for the chosen role and name.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 pt-2 flex flex-col min-h-0">
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="apt-bulk-treatmentRole">Role <span className="text-red-500">*</span></Label>
+                <Input
+                  id="apt-bulk-treatmentRole"
+                  value={treatmentForm.doctorRole}
+                  readOnly
+                  className="bg-muted cursor-not-allowed"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="apt-bulk-treatmentDoctorName">Select Name <span className="text-red-500">*</span></Label>
+                <Input
+                  id="apt-bulk-treatmentDoctorName"
+                  value={treatmentForm.doctorName}
+                  readOnly
+                  className="bg-muted cursor-not-allowed"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="apt-select-all-treatments"
+                  checked={(treatmentsInfoList || []).length > 0 && (treatmentsInfoList || []).every((info: any) => bulkTreatmentSelections[String(info.id)]?.selected)}
+                  onCheckedChange={(checked) => {
+                    setBulkTreatmentSelections((prev) =>
+                      (treatmentsInfoList || []).reduce((acc: Record<string, { selected: boolean; price: string }>, info: any) => ({
+                        ...acc,
+                        [String(info.id)]: { selected: !!checked, price: prev[String(info.id)]?.price ?? "" },
+                      }), {}),
+                    );
+                  }}
+                />
+                <label htmlFor="apt-select-all-treatments" className="text-sm font-medium cursor-pointer">
+                  Select all treatments
+                </label>
+              </div>
+
+              <div className="flex items-center gap-2 ml-auto">
+                <Label htmlFor="apt-bulk-default-price" className="text-sm text-gray-500 whitespace-nowrap">
+                  Default price ({currencyCodeForTreatments}):
+                </Label>
+                <Input
+                  id="apt-bulk-default-price"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  placeholder="e.g. 50"
+                  className="w-24 h-8 text-sm"
+                  value={bulkDefaultPrice}
+                  onChange={(e) => setBulkDefaultPrice(e.target.value)}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  onClick={() => {
+                    const val = bulkDefaultPrice.trim();
+                    if (val === "") return;
+                    setBulkTreatmentSelections((prev) =>
+                      (treatmentsInfoList || []).reduce((acc: Record<string, { selected: boolean; price: string }>, info: any) => ({
+                        ...acc,
+                        [String(info.id)]: { selected: prev[String(info.id)]?.selected ?? false, price: val },
+                      }), {}),
+                    );
+                  }}
+                >
+                  Apply to all
+                </Button>
+              </div>
+            </div>
+
+            <div className="border rounded-md max-h-[320px] overflow-y-auto space-y-1 p-2">
+              {loadingTreatmentsInfo ? (
+                <p className="text-sm text-gray-500 py-2">Loading treatments...</p>
+              ) : (treatmentsInfoList || []).length === 0 ? (
+                <p className="text-sm text-gray-500 py-2">
+                  No treatments configured. Add entries under Pricing → Treatments metadata first.
+                </p>
+              ) : (
+                (treatmentsInfoList || []).map((info: any) => {
+                  const id = String(info.id);
+                  const sel = bulkTreatmentSelections[id] ?? { selected: false, price: "" };
+                  return (
+                    <div key={info.id} className="flex items-center gap-3 py-2 border-b border-gray-100 dark:border-gray-700 last:border-0">
+                      <Checkbox
+                        checked={sel.selected}
+                        onCheckedChange={(checked) =>
+                          setBulkTreatmentSelections((prev) => ({ ...prev, [id]: { ...sel, selected: !!checked } }))
+                        }
+                      />
+                      <span className="flex-1 text-sm truncate" title={info.name}>{info.name}</span>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        placeholder="Price"
+                        className="w-24 h-8 text-sm"
+                        value={sel.price}
+                        onChange={(e) =>
+                          setBulkTreatmentSelections((prev) => ({ ...prev, [id]: { ...sel, price: e.target.value } }))
+                        }
+                      />
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {treatmentError && <p className="text-sm text-red-500">{treatmentError}</p>}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setShowAddTreatmentDialog(false)} disabled={isSavingTreatment}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleBulkTreatmentSave}
+              disabled={isSavingTreatment || (treatmentsInfoList || []).length === 0}
+            >
+              {isSavingTreatment ? "Adding..." : "Add Selected Treatments"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Doctor Fee (Consultations) Dialog - reused from Billing */}
+      <Dialog open={showAddConsultationDialog} onOpenChange={setShowAddConsultationDialog}>
+        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto dark:border-gray-700 dark:bg-slate-800">
+          <DialogHeader>
+            <DialogTitle>Add Doctor Fee</DialogTitle>
+            <DialogDescription>Add a new doctor fee to your pricing list.</DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-4 py-2">
+            {(() => {
+              const fees = Array.isArray(consultationServices) ? consultationServices : [];
+              const doctorId = consultationForm.doctorId;
+              const filtered = doctorId != null ? fees.filter((f: any) => Number(f?.doctorId) === Number(doctorId)) : [];
+              if (filtered.length === 0) return null;
+              return (
+                <div className="space-y-2">
+                  <Label className="text-base font-semibold">Existing Doctor Fees in Database</Label>
+                  <div className="border rounded-md overflow-hidden max-h-56 overflow-y-auto bg-gray-50 dark:bg-gray-900">
+                    <table className="w-full">
+                      <thead className="bg-gray-100 dark:bg-gray-800 sticky top-0">
+                        <tr>
+                          <th className="text-left p-2 text-sm font-medium">Service Name</th>
+                          <th className="text-left p-2 text-sm font-medium">Code</th>
+                          <th className="text-left p-2 text-sm font-medium">Category</th>
+                          <th className="text-left p-2 text-sm font-medium">Price</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filtered.map((fee: any) => (
+                          <tr key={fee.id} className="border-t">
+                            <td className="p-2 text-sm">{fee.serviceName}</td>
+                            <td className="p-2 text-sm">{fee.serviceCode || "-"}</td>
+                            <td className="p-2 text-sm">{fee.category || "-"}</td>
+                            <td className="p-2 text-sm">
+                              {fee.currency || currencyCodeForConsultations} {fee.basePrice ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1">
+                <Label>Role <span className="text-red-500">*</span></Label>
+                <Input value={consultationForm.doctorRole} readOnly className="bg-muted cursor-not-allowed" />
+              </div>
+              <div className="space-y-1">
+                <Label>Select Name <span className="text-red-500">*</span></Label>
+                <Input value={consultationForm.doctorName} readOnly className="bg-muted cursor-not-allowed" />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-base font-semibold">Add Custom Doctor Fee</Label>
+              <div className="border rounded-md overflow-hidden max-h-72 overflow-y-auto">
+                <table className="w-full">
+                  <thead className="bg-gray-50 dark:bg-gray-800 sticky top-0">
+                    <tr>
+                      <th className="text-left p-2 text-sm font-medium">Service Name *</th>
+                      <th className="text-left p-2 text-sm font-medium">Service Code</th>
+                      <th className="text-left p-2 text-sm font-medium">Category</th>
+                      <th className="text-left p-2 text-sm font-medium">Base Price ({currencyCodeForConsultations}) *</th>
+                      <th className="w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {multipleConsultationServices.map((service, index) => (
+                      <tr key={index} className="border-t">
+                        <td className="p-2">
+                          <Input
+                            value={service.serviceName}
+                            onChange={(e) => {
+                              const updated = [...multipleConsultationServices];
+                              updated[index].serviceName = e.target.value;
+                              const words = e.target.value.trim().split(/\s+/);
+                              const initials = words.map((w) => w.charAt(0).toUpperCase()).join("");
+                              if (initials) updated[index].serviceCode = `${initials}001`;
+                              setMultipleConsultationServices(updated);
+                            }}
+                            placeholder="e.g., General Consultation"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <Input
+                            value={service.serviceCode}
+                            onChange={(e) => {
+                              const updated = [...multipleConsultationServices];
+                              updated[index].serviceCode = e.target.value;
+                              setMultipleConsultationServices(updated);
+                            }}
+                            placeholder="e.g., GC001"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <Input
+                            value={service.category}
+                            onChange={(e) => {
+                              const updated = [...multipleConsultationServices];
+                              updated[index].category = e.target.value;
+                              setMultipleConsultationServices(updated);
+                            }}
+                            placeholder="e.g., Diagnostic"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <Input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={service.basePrice}
+                            onChange={(e) => {
+                              const updated = [...multipleConsultationServices];
+                              updated[index].basePrice = e.target.value;
+                              setMultipleConsultationServices(updated);
+                            }}
+                            placeholder="0.00"
+                          />
+                        </td>
+                        <td className="p-2">
+                          {multipleConsultationServices.length > 1 && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => {
+                                const updated = multipleConsultationServices.filter((_, i) => i !== index);
+                                setMultipleConsultationServices(updated);
+                              }}
+                            >
+                              <Trash2 className="h-4 w-4 text-red-500" />
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setMultipleConsultationServices((prev) => [...prev, { serviceName: "", serviceCode: "", category: "", basePrice: "" }])}
+                className="w-full"
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                Add More Service
+              </Button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Switch checked={consultationActive} onCheckedChange={setConsultationActive} />
+              <span className="text-sm">Active</span>
+            </div>
+
+            {consultationError && <p className="text-sm text-red-500">{consultationError}</p>}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setShowAddConsultationDialog(false)} disabled={isSavingConsultations}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveConsultations} disabled={isSavingConsultations}>
+              {isSavingConsultations ? "Creating..." : "Create"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Appointment Confirmation Dialog */}
       <Dialog open={showConfirmationDialog} onOpenChange={setShowConfirmationDialog}>
         <DialogContent className="max-w-2xl dark:border-gray-700 dark:bg-slate-800">
@@ -5473,7 +6186,14 @@ Medical License: [License Number]
                 }}
                 disabled={createAppointmentMutation.isPending}
               >
-                {createAppointmentMutation.isPending ? "Confirming..." : "Confirm"}
+                {createAppointmentMutation.isPending ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Confirming...
+                  </span>
+                ) : (
+                  "Confirm"
+                )}
               </Button>
           </div>
         </DialogContent>
@@ -6448,6 +7168,16 @@ Medical License: [License Number]
                             </Command>
                           </PopoverContent>
                         </Popover>
+                        {selectedRole && selectedProviderId && (
+                          <button
+                            type="button"
+                            onClick={() => openAddTreatmentsPopup()}
+                            className="mt-2 text-sm text-blue-600 hover:text-blue-700 underline"
+                            data-testid="link-add-treatments-edit"
+                          >
+                            Add new treatments for this role and name
+                          </button>
+                        )}
                         {editAppointmentSelectedTreatment && (
                           <Button
                             variant="ghost"
@@ -6489,6 +7219,23 @@ Medical License: [License Number]
                                   </CommandItem>
                                 )}
                                 <CommandEmpty>No consultations found.</CommandEmpty>
+                                {!isConsultationsLoading &&
+                                  filteredConsultationsForSelection.length === 0 &&
+                                  selectedRole &&
+                                  selectedProviderId && (
+                                    <div className="px-3 py-2 border-t border-gray-100 dark:border-gray-700">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setOpenEditConsultationCombo(false);
+                                          openAddConsultationsPopup();
+                                        }}
+                                        className="text-sm text-blue-600 hover:text-blue-700 underline"
+                                      >
+                                        Add new consultations for this role and name
+                                      </button>
+                                    </div>
+                                  )}
                                 <CommandGroup>
                                   {filteredConsultationsForSelection.map((service: any) => (
                                     <CommandItem
@@ -6513,6 +7260,16 @@ Medical License: [License Number]
                             </Command>
                           </PopoverContent>
                         </Popover>
+                        {selectedRole && selectedProviderId && (
+                          <button
+                            type="button"
+                            onClick={() => openAddConsultationsPopup()}
+                            className="mt-2 text-sm text-blue-600 hover:text-blue-700 underline"
+                            data-testid="link-add-consultations-edit"
+                          >
+                            Add new consultations for this role and name
+                          </button>
+                        )}
                         {editAppointmentSelectedConsultation && (
                           <Button
                             variant="ghost"

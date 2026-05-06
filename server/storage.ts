@@ -203,9 +203,11 @@ export interface IStorage {
   getPatientByUserId(userId: number, organizationId: number): Promise<Patient | undefined>;
   getPatientByEmail(email: string, organizationId: number): Promise<Patient | undefined>;
   getPatientsByOrganization(organizationId: number, limit?: number, isActive?: boolean): Promise<Patient[]>;
+  getPatientsByUserId(organizationId: number, userId: number): Promise<Patient[]>;
   createPatient(patient: InsertPatient): Promise<Patient>;
   updatePatient(id: number, organizationId: number, updates: Partial<InsertPatient>): Promise<Patient | undefined>;
   deletePatient(id: number, organizationId: number): Promise<boolean>;
+  deletePatientRecordOnly(id: number, organizationId: number): Promise<boolean>;
   searchPatients(organizationId: number, query: string): Promise<Patient[]>;
 
   // Medical Records
@@ -1350,6 +1352,16 @@ export class DatabaseStorage implements IStorage {
     return uniqueResults.map(patient => this.normalizePatientData(patient)).filter(Boolean) as Patient[];
   }
 
+  async getPatientsByUserId(organizationId: number, userId: number): Promise<Patient[]> {
+    const results = await db
+      .select()
+      .from(patients)
+      .where(and(eq(patients.organizationId, organizationId), eq(patients.userId, userId)))
+      .orderBy(desc(patients.updatedAt));
+
+    return results.map(patient => this.normalizePatientData(patient)).filter(Boolean) as Patient[];
+  }
+
   async createPatient(patient: InsertPatient): Promise<Patient> {
     console.log("🔍 [STORAGE] createPatient called with userId:", (patient as any).userId);
     const { address, medicalHistory, communicationPreferences, ...baseFields } = patient;
@@ -1460,6 +1472,45 @@ export class DatabaseStorage implements IStorage {
       return (patientResult.rowCount || 0) > 0;
     } catch (error) {
       console.error("❌ Error deleting patient:", error);
+      return false;
+    }
+  }
+
+  // Delete a patient record and its related clinical data, but do NOT delete the linked user account.
+  // This is required for "family members" where multiple patients share the same userId.
+  async deletePatientRecordOnly(id: number, organizationId: number): Promise<boolean> {
+    try {
+      const [patient] = await db.select()
+        .from(patients)
+        .where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)))
+        .limit(1);
+
+      if (!patient) return false;
+
+      await db.delete(medicalRecords)
+        .where(and(eq(medicalRecords.patientId, id), eq(medicalRecords.organizationId, organizationId)));
+
+      await db.delete(appointments)
+        .where(and(eq(appointments.patientId, id), eq(appointments.organizationId, organizationId)));
+
+      await db.delete(aiInsights)
+        .where(and(eq(aiInsights.patientId, id), eq(aiInsights.organizationId, organizationId)));
+
+      await db.delete(prescriptions)
+        .where(and(eq(prescriptions.patientId, id), eq(prescriptions.organizationId, organizationId)));
+
+      await db.delete(labResults)
+        .where(and(eq(labResults.patientId, id), eq(labResults.organizationId, organizationId)));
+
+      await db.delete(medicalImages)
+        .where(and(eq(medicalImages.patientId, id), eq(medicalImages.organizationId, organizationId)));
+
+      const patientResult = await db.delete(patients)
+        .where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)));
+
+      return (patientResult.rowCount || 0) > 0;
+    } catch (error) {
+      console.error("❌ Error deleting patient record only:", error);
       return false;
     }
   }

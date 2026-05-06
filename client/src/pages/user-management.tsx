@@ -1397,6 +1397,55 @@ export default function UserManagement() {
   const [activeTab, setActiveTab] = useState<"users" | "roles">("users");
   const [roleNameError, setRoleNameError] = useState<string>("");
   const [roleDisplayNameError, setRoleDisplayNameError] = useState<string>("");
+
+  const relationOptions = ["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"] as const;
+
+  const familyMemberSchema = z.object({
+    fullName: z.string().trim().min(2, "Full name is required"),
+    dateOfBirth: z.string().optional().nullable(),
+    genderAtBirth: z.string().optional().nullable(),
+    relation: z.enum(relationOptions),
+  });
+
+  type FamilyMemberFormData = z.infer<typeof familyMemberSchema>;
+
+  const [familyModalOpen, setFamilyModalOpen] = useState(false);
+  const [familyForUser, setFamilyForUser] = useState<User | null>(null);
+  const [editingFamilyMemberId, setEditingFamilyMemberId] = useState<number | null>(null);
+
+  const familyMemberForm = useForm<FamilyMemberFormData>({
+    resolver: zodResolver(familyMemberSchema) as Resolver<FamilyMemberFormData>,
+    defaultValues: {
+      fullName: "",
+      dateOfBirth: "",
+      genderAtBirth: "",
+      relation: "Other",
+    },
+  });
+
+  const openFamilyModal = (patientUser: User) => {
+    setFamilyForUser(patientUser);
+    setEditingFamilyMemberId(null);
+    familyMemberForm.reset({
+      fullName: "",
+      dateOfBirth: "",
+      genderAtBirth: "",
+      relation: "Other",
+    });
+    setFamilyModalOpen(true);
+  };
+
+  const closeFamilyModal = () => {
+    setFamilyModalOpen(false);
+    setFamilyForUser(null);
+    setEditingFamilyMemberId(null);
+    familyMemberForm.reset({
+      fullName: "",
+      dateOfBirth: "",
+      genderAtBirth: "",
+      relation: "Other",
+    });
+  };
   
   // View type states
   const [userViewType, setUserViewType] = useState<"list" | "table" | "grid">("list");
@@ -2141,8 +2190,9 @@ export default function UserManagement() {
       // Also invalidate for the current user if they're editing their own role
       // This ensures the sidebar updates immediately when Admin edits Admin role
       // Note: user is from component scope (line 1066)
-      if (user?.role === updatedRole.name) {
-        await queryClient.invalidateQueries({ queryKey: ["/api/roles/by-name", user.role] });
+      const currentUserRoleName = user?.role;
+      if (currentUserRoleName && currentUserRoleName === updatedRole.name) {
+        await queryClient.invalidateQueries({ queryKey: ["/api/roles/by-name", currentUserRoleName] });
       }
       
       // Close the Edit Role popup as requested
@@ -2583,6 +2633,115 @@ export default function UserManagement() {
       toast({
         title: "Error deleting user",
         description: "There was a problem deleting the user. Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const familyMembersUserId = familyForUser?.id;
+
+  const { data: familyMembers = [], isLoading: familyLoading, refetch: refetchFamily } = useQuery({
+    queryKey: ["/api/patients/by-user", familyMembersUserId],
+    queryFn: async () => {
+      if (!familyMembersUserId) return [];
+      const response = await apiRequest("GET", `/api/patients/by-user/${familyMembersUserId}`);
+      const data = await response.json();
+      return Array.isArray(data) ? data : [];
+    },
+    enabled: !!familyMembersUserId && familyModalOpen && user?.role === "admin",
+  });
+
+  const createFamilyMemberMutation = useMutation({
+    mutationFn: async (data: FamilyMemberFormData) => {
+      if (!familyForUser) throw new Error("No user selected");
+      const fullName = (data.fullName || "").trim().replace(/\s+/g, " ");
+      const parts = fullName.split(" ");
+      const firstName = parts.slice(0, -1).join(" ") || parts[0] || fullName;
+      const lastName = parts.length > 1 ? parts[parts.length - 1] : "Family";
+
+      const response = await apiRequest("POST", "/api/patients/family-member", {
+        userId: familyForUser.id,
+        firstName,
+        lastName,
+        dateOfBirth: data.dateOfBirth || null,
+        genderAtBirth: data.genderAtBirth || null,
+        relation: data.relation,
+      });
+      return response.json();
+    },
+    onSuccess: async () => {
+      await refetchFamily();
+      setEditingFamilyMemberId(null);
+      familyMemberForm.reset({
+        fullName: "",
+        dateOfBirth: "",
+        genderAtBirth: "",
+        relation: "Other",
+      });
+      toast({ title: "Family member added" });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error?.message || "Failed to add family member",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const updateFamilyMemberMutation = useMutation({
+    mutationFn: async (data: FamilyMemberFormData) => {
+      if (!familyForUser) throw new Error("No user selected");
+      if (!editingFamilyMemberId) throw new Error("No family member selected");
+
+      const fullName = (data.fullName || "").trim().replace(/\s+/g, " ");
+      const parts = fullName.split(" ");
+      const firstName = parts.slice(0, -1).join(" ") || parts[0] || fullName;
+      const lastName = parts.length > 1 ? parts[parts.length - 1] : "Family";
+
+      const response = await apiRequest("PATCH", `/api/patients/family-member/${editingFamilyMemberId}`, {
+        userId: familyForUser.id,
+        firstName,
+        lastName,
+        dateOfBirth: data.dateOfBirth || null,
+        genderAtBirth: data.genderAtBirth || null,
+        relation: data.relation,
+      });
+      return response.json();
+    },
+    onSuccess: async () => {
+      await refetchFamily();
+      setEditingFamilyMemberId(null);
+      familyMemberForm.reset({
+        fullName: "",
+        dateOfBirth: "",
+        genderAtBirth: "",
+        relation: "Other",
+      });
+      toast({ title: "Family member updated" });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error?.message || "Failed to update family member",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const deleteFamilyMemberMutation = useMutation({
+    mutationFn: async (patientId: number) => {
+      if (!familyForUser) throw new Error("No user selected");
+      await apiRequest("DELETE", `/api/patients/family-member/${patientId}?userId=${familyForUser.id}`);
+    },
+    onSuccess: async () => {
+      await refetchFamily();
+      toast({ title: "Family member deleted" });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error?.message || "Failed to delete family member",
         variant: "destructive",
       });
     },
@@ -4616,9 +4775,8 @@ export default function UserManagement() {
                                     : form.watch("emergencyContact.phone") || "";
                                   form.setValue("emergencyContact.phone", phoneWithoutCode ? `${value} ${phoneWithoutCode}` : "");
                                 }}
-                                className={form.formState.errors.emergencyContact?.phone ? "border-red-500" : ""}
                               >
-                                <SelectTrigger className="w-[140px]">
+                                <SelectTrigger className={`w-[140px] ${form.formState.errors.emergencyContact?.phone ? "border-red-500" : ""}`}>
                                   <SelectValue>
                                     <div className="flex items-center gap-2">
                                       <img 
@@ -5091,25 +5249,39 @@ export default function UserManagement() {
                               {getRoleIcon(user.role)}
                             </div>
                             <div className="min-w-0 flex-1">
-                              <h3
-                                className="font-medium text-gray-900 dark:text-gray-100 truncate"
-                                title={`${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim()}
-                              >
-                                {(() => {
-                                  const fullName = `${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim();
-                                  return fullName.length > 20 ? fullName.slice(0, 20) + '...' : fullName;
-                                })()}
-                              </h3>
+                              <div className="flex items-center gap-2 min-w-0">
+                                <h3
+                                  className="font-medium text-gray-900 dark:text-gray-100 truncate"
+                                  title={`${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim()}
+                                >
+                                  {(() => {
+                                    const fullName = `${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim();
+                                    return fullName.length > 20 ? fullName.slice(0, 20) + '...' : fullName;
+                                  })()}
+                                </h3>
+                                {user.role === "patient" && (
+                                  <Badge variant={user.isActive ? "default" : "secondary"}>
+                                    {user.isActive ? "Active" : "Inactive"}
+                                  </Badge>
+                                )}
+                              </div>
                               {user.professionalRegistrationId?.trim() && (
                                 <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
                                   Professional_RegistrationID: {user.professionalRegistrationId}
                                 </p>
                               )}
                               <p
-                                className="text-sm text-gray-500 dark:text-gray-400 truncate"
+                                className="text-sm text-gray-500 dark:text-gray-400 truncate flex items-center gap-2"
                                 title={user.email}
                               >
-                                {user.email.length > 20 ? user.email.slice(0, 20) + '...' : user.email}
+                                <span className="truncate">
+                                  {user.email.length > 20 ? user.email.slice(0, 20) + '...' : user.email}
+                                </span>
+                                {user.role === "patient" && (
+                                  <Badge className={getRoleColor(user.role)}>
+                                    {getRoleDisplayName(user.role)}
+                                  </Badge>
+                                )}
                               </p>
                               {user.department && user.department.trim() && (
                                 <p className="text-xs text-gray-400 dark:text-gray-500">{user.department}</p>
@@ -5139,15 +5311,32 @@ export default function UserManagement() {
                           </div>
                           
                           <div className="flex items-center space-x-3">
-                            <Badge className={getRoleColor(user.role)}>
-                              {getRoleDisplayName(user.role)}
-                            </Badge>
-                            
-                            <Badge variant={user.isActive ? "default" : "secondary"}>
-                              {user.isActive ? "Active" : "Inactive"}
-                            </Badge>
+                            {user.role !== "patient" && (
+                              <>
+                                <Badge className={getRoleColor(user.role)}>
+                                  {getRoleDisplayName(user.role)}
+                                </Badge>
+
+                                <Badge variant={user.isActive ? "default" : "secondary"}>
+                                  {user.isActive ? "Active" : "Inactive"}
+                                </Badge>
+                              </>
+                            )}
                             
                             <div className="flex items-center space-x-2">
+                              {user.role === "patient" && canManageRoles && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => openFamilyModal(user)}
+                                  title="Add / manage family members"
+                                  data-testid={`button-add-family-member-${user.id}`}
+                                  className="flex items-center gap-1"
+                                >
+                                  <Plus className="h-4 w-4" />
+                                  <span>Add Family Member</span>
+                                </Button>
+                              )}
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -5263,7 +5452,16 @@ export default function UserManagement() {
                         data-testid={`user-table-row-${user.id}`}
                       >
                         <td className="px-4 py-3 text-gray-900 dark:text-gray-100">
-                          {user.firstName || "N/A"} {user.lastName || "N/A"}
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="truncate">
+                              {user.firstName || "N/A"} {user.lastName || "N/A"}
+                            </span>
+                            {user.role === "patient" && (
+                              <Badge variant={user.isActive ? "default" : "secondary"}>
+                                {user.isActive ? "Active" : "Inactive"}
+                              </Badge>
+                            )}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <Badge className={getRoleColor(user.role)}>
@@ -5273,17 +5471,41 @@ export default function UserManagement() {
                         <td className="px-4 py-3 text-gray-700 dark:text-gray-300">
                           {user.professionalRegistrationId?.trim() || "-"}
                         </td>
-                        <td className="px-4 py-3 text-gray-700 dark:text-gray-300">{user.email}</td>
+                        <td className="px-4 py-3 text-gray-700 dark:text-gray-300">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="truncate">{user.email}</span>
+                            {user.role === "patient" && (
+                              <Badge className={getRoleColor(user.role)}>
+                                {getRoleDisplayName(user.role)}
+                              </Badge>
+                            )}
+                          </div>
+                        </td>
                         <td className="px-4 py-3 text-gray-700 dark:text-gray-300">
                           {user.department?.trim() || "-"}
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant={user.isActive ? "default" : "secondary"}>
-                            {user.isActive ? "Active" : "Inactive"}
-                          </Badge>
+                          {user.role !== "patient" && (
+                            <Badge variant={user.isActive ? "default" : "secondary"}>
+                              {user.isActive ? "Active" : "Inactive"}
+                            </Badge>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center justify-end gap-2">
+                            {user.role === "patient" && canManageRoles && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => openFamilyModal(user)}
+                                title="Add / manage family members"
+                                data-testid={`button-add-family-member-table-${user.id}`}
+                                className="flex items-center gap-1"
+                              >
+                                <Plus className="h-4 w-4" />
+                                <span>Add Family Member</span>
+                              </Button>
+                            )}
                             <Button
                               variant="outline"
                               size="sm"
@@ -5342,25 +5564,38 @@ export default function UserManagement() {
                             {getRoleIcon(user.role)}
                           </div>
                           <div>
-                            <h3 className="font-medium text-gray-900 dark:text-gray-100">
-                              {user.firstName || 'N/A'} {user.lastName || 'N/A'}
-                            </h3>
+                            <div className="flex items-center gap-2 min-w-0">
+                              <h3 className="font-medium text-gray-900 dark:text-gray-100 truncate">
+                                {user.firstName || 'N/A'} {user.lastName || 'N/A'}
+                              </h3>
+                              {user.role === "patient" && (
+                                <Badge variant={user.isActive ? "default" : "secondary"}>
+                                  {user.isActive ? "Active" : "Inactive"}
+                                </Badge>
+                              )}
+                            </div>
                             {user.professionalRegistrationId?.trim() && (
                               <p className="text-xs text-gray-500 dark:text-gray-400">
                                 Professional_RegistrationID: {user.professionalRegistrationId}
                               </p>
                             )}
-                            <Badge className={getRoleColor(user.role)}>
-                              {getRoleDisplayName(user.role)}
-                            </Badge>
                           </div>
                         </div>
-                        <Badge variant={user.isActive ? "default" : "secondary"}>
-                          {user.isActive ? "Active" : "Inactive"}
-                        </Badge>
+                        {user.role !== "patient" && (
+                          <Badge variant={user.isActive ? "default" : "secondary"}>
+                            {user.isActive ? "Active" : "Inactive"}
+                          </Badge>
+                        )}
                       </div>
                       
-                      <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">{user.email}</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400 mb-2 flex items-center gap-2">
+                        <span className="truncate">{user.email}</span>
+                        {user.role === "patient" && (
+                          <Badge className={getRoleColor(user.role)}>
+                            {getRoleDisplayName(user.role)}
+                          </Badge>
+                        )}
+                      </p>
                       
                       {user.department && user.department.trim() && (
                         <p className="text-xs text-gray-400 dark:text-gray-500 mb-2">{user.department}</p>
@@ -5388,6 +5623,19 @@ export default function UserManagement() {
                       )}
                       
                       <div className="flex items-center justify-end space-x-2 pt-3 border-t">
+                        {user.role === "patient" && canManageRoles && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => openFamilyModal(user)}
+                            title="Add / manage family members"
+                            data-testid={`button-add-family-member-grid-${user.id}`}
+                            className="flex items-center gap-1"
+                          >
+                            <Plus className="h-4 w-4" />
+                            <span>Add Family Member</span>
+                          </Button>
+                        )}
                         <Button
                           variant="outline"
                           size="sm"
@@ -5481,6 +5729,257 @@ export default function UserManagement() {
             )}
           </CardContent>
         </Card>
+
+        <Dialog
+          open={familyModalOpen}
+          onOpenChange={(open) => {
+            if (!open) closeFamilyModal();
+          }}
+        >
+          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>Add Family Member</DialogTitle>
+              <DialogDescription>
+                {familyForUser ? (
+                  <span>
+                    Linked user: <span className="font-medium">{familyForUser.firstName} {familyForUser.lastName}</span> ({familyForUser.email})
+                  </span>
+                ) : (
+                  "Select a patient user to manage family members."
+                )}
+              </DialogDescription>
+            </DialogHeader>
+
+            {familyForUser && (
+              <div className="space-y-6">
+                <div className="rounded-lg border p-4 bg-gray-50 dark:bg-gray-900">
+                  <div className="text-sm text-gray-700 dark:text-gray-300">
+                    <div className="flex justify-between gap-4">
+                      <span className="font-medium">User ID</span>
+                      <span className="text-gray-900 dark:text-gray-100">{familyForUser.id}</span>
+                    </div>
+                    <div className="flex justify-between gap-4">
+                      <span className="font-medium">Name</span>
+                      <span className="text-gray-900 dark:text-gray-100">{familyForUser.firstName} {familyForUser.lastName}</span>
+                    </div>
+                    <div className="flex justify-between gap-4">
+                      <span className="font-medium">Email</span>
+                      <span className="text-gray-900 dark:text-gray-100">{familyForUser.email}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={familyMemberForm.handleSubmit((data) => {
+                    if (editingFamilyMemberId) {
+                      updateFamilyMemberMutation.mutate(data);
+                    } else {
+                      createFamilyMemberMutation.mutate(data);
+                    }
+                  })}
+                  className="space-y-4"
+                >
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2 md:col-span-2">
+                      <Label htmlFor="familyFullName">Full Name</Label>
+                      <Input
+                        id="familyFullName"
+                        placeholder="e.g. John Smith"
+                        value={familyMemberForm.watch("fullName") || ""}
+                        onChange={(e) => familyMemberForm.setValue("fullName", e.target.value, { shouldValidate: true })}
+                      />
+                      {familyMemberForm.formState.errors.fullName && (
+                        <p className="text-sm text-red-500">{familyMemberForm.formState.errors.fullName.message}</p>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="familyDob">Date of Birth</Label>
+                      <Input
+                        id="familyDob"
+                        type="date"
+                        value={familyMemberForm.watch("dateOfBirth") || ""}
+                        onChange={(e) => familyMemberForm.setValue("dateOfBirth", e.target.value, { shouldValidate: true })}
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Gender</Label>
+                      <Select
+                        value={familyMemberForm.watch("genderAtBirth") || ""}
+                        onValueChange={(v) => familyMemberForm.setValue("genderAtBirth", v, { shouldValidate: true })}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select gender" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="male">Male</SelectItem>
+                          <SelectItem value="female">Female</SelectItem>
+                          <SelectItem value="other">Other</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-2 md:col-span-2">
+                      <Label>Relation</Label>
+                      <Select
+                        value={familyMemberForm.watch("relation")}
+                        onValueChange={(v) => familyMemberForm.setValue("relation", v as any, { shouldValidate: true })}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select relation" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {relationOptions.map((rel) => (
+                            <SelectItem key={rel} value={rel}>{rel}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {familyMemberForm.formState.errors.relation && (
+                        <p className="text-sm text-red-500">{familyMemberForm.formState.errors.relation.message}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <DialogFooter className="gap-2">
+                    {editingFamilyMemberId && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => {
+                          setEditingFamilyMemberId(null);
+                          familyMemberForm.reset({
+                            fullName: "",
+                            dateOfBirth: "",
+                            genderAtBirth: "",
+                            relation: "Other",
+                          });
+                        }}
+                      >
+                        Cancel Edit
+                      </Button>
+                    )}
+                    <Button
+                      type="submit"
+                      disabled={createFamilyMemberMutation.isPending || updateFamilyMemberMutation.isPending}
+                      className="flex items-center gap-2"
+                    >
+                      <Plus className="h-4 w-4" />
+                      {editingFamilyMemberId ? "Update Family Member" : "Add Family Member"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      Family Members ({Array.isArray(familyMembers) ? familyMembers.length : 0})
+                    </h3>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => refetchFamily()}
+                      disabled={familyLoading}
+                    >
+                      Refresh
+                    </Button>
+                  </div>
+
+                  {familyLoading ? (
+                    <div className="text-sm text-gray-500">Loading...</div>
+                  ) : !Array.isArray(familyMembers) || familyMembers.length === 0 ? (
+                    <div className="text-sm text-gray-500">No family members found.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {familyMembers.map((m: any) => {
+                        const relation = (m.relation || "Other") as string;
+                        const isSelf = relation === "Self";
+                        return (
+                          <div
+                            key={m.id}
+                            className="flex items-center justify-between gap-3 rounded-lg border p-3 bg-white dark:bg-gray-950"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="font-medium text-gray-900 dark:text-gray-100 truncate">
+                                  {m.firstName} {m.lastName}
+                                </span>
+                                <Badge variant="secondary">{relation}</Badge>
+                              </div>
+                              <div className="text-xs text-gray-500">
+                                DOB: {m.dateOfBirth || "-"} • Gender: {m.genderAtBirth || "-"} • Patient ID: {m.patientId || "-"}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  setEditingFamilyMemberId(m.id);
+                                  familyMemberForm.reset({
+                                    fullName: `${m.firstName || ""} ${m.lastName || ""}`.trim(),
+                                    dateOfBirth: m.dateOfBirth || "",
+                                    genderAtBirth: m.genderAtBirth || "",
+                                    relation: (m.relation || "Other") as any,
+                                  });
+                                }}
+                                title="Edit family member"
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+
+                              <AlertDialog>
+                                <AlertDialogTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    className="text-red-600 hover:text-red-700"
+                                    disabled={isSelf || deleteFamilyMemberMutation.isPending}
+                                    title={isSelf ? "Cannot delete Self record" : "Delete family member"}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </AlertDialogTrigger>
+                                <AlertDialogContent>
+                                  <AlertDialogHeader>
+                                    <AlertDialogTitle>Delete Family Member</AlertDialogTitle>
+                                    <AlertDialogDescription>
+                                      Delete {m.firstName} {m.lastName} ({relation})? This will delete the patient record but will not delete the linked user account.
+                                    </AlertDialogDescription>
+                                  </AlertDialogHeader>
+                                  <AlertDialogFooter>
+                                    <AlertDialogCancel>No, Cancel</AlertDialogCancel>
+                                    <AlertDialogAction
+                                      onClick={() => deleteFamilyMemberMutation.mutate(m.id)}
+                                      className="bg-red-600 hover:bg-red-700"
+                                      disabled={isSelf || deleteFamilyMemberMutation.isPending}
+                                    >
+                                      Yes, Delete
+                                    </AlertDialogAction>
+                                  </AlertDialogFooter>
+                                </AlertDialogContent>
+                              </AlertDialog>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={closeFamilyModal}>
+                Close
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
           </>
         )}
 

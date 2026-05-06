@@ -5066,6 +5066,130 @@ This treatment plan should be reviewed and adjusted based on individual patient 
     }
   });
 
+  // Family members: list all patient records for a given userId (same user can have multiple patient rows).
+  // Restricted to admin (used from User Management).
+  app.get("/api/patients/by-user/:userId", authMiddleware, requireRole(["admin"]), async (req: TenantRequest, res) => {
+    try {
+      const userId = parseInt(req.params.userId, 10);
+      if (Number.isNaN(userId)) return res.status(400).json({ error: "Invalid userId" });
+
+      const orgId = req.tenant!.id;
+      const rows = await storage.getPatientsByUserId(orgId, userId);
+      return res.json(rows);
+    } catch (error) {
+      console.error("Patients by userId fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch patients for user" });
+    }
+  });
+
+  // Family members: create a new patient row using an existing userId (does NOT create a new user).
+  app.post("/api/patients/family-member", authMiddleware, requireRole(["admin"]), async (req: TenantRequest, res) => {
+    try {
+      const orgId = req.tenant!.id;
+
+      const body = z.object({
+        userId: z.number(),
+        firstName: z.string().trim().min(1),
+        lastName: z.string().trim().min(1),
+        dateOfBirth: z.string().optional().nullable(),
+        genderAtBirth: z.string().optional().nullable(),
+        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
+      }).parse(req.body);
+
+      // Generate patient ID (org scoped)
+      const patientCount = await storage.getPatientsByOrganization(orgId, 999999);
+      const patientId = `P${(patientCount.length + 1).toString().padStart(6, '0')}`;
+
+      const created = await storage.createPatient({
+        organizationId: orgId,
+        userId: body.userId,
+        patientId,
+        firstName: body.firstName,
+        lastName: body.lastName,
+        relation: body.relation ?? "Other",
+        dateOfBirth: body.dateOfBirth ? (body.dateOfBirth as any) : null,
+        genderAtBirth: body.genderAtBirth ?? null,
+        email: null,
+        phone: null,
+        nhsNumber: null,
+        address: {},
+        insuranceInfo: {},
+        emergencyContact: {},
+        medicalHistory: {},
+        flags: [],
+        communicationPreferences: {},
+        isActive: true,
+        isInsured: false,
+        createdBy: req.user!.id,
+        riskLevel: "low",
+      } as any);
+
+      return res.status(201).json(created);
+    } catch (error: any) {
+      console.error("Family member patient creation error:", error);
+      res.status(500).json({ error: error?.message || "Failed to create family member" });
+    }
+  });
+
+  // Family members: update a patient row, but only if it belongs to the provided userId.
+  app.patch("/api/patients/family-member/:id", authMiddleware, requireRole(["admin"]), async (req: TenantRequest, res) => {
+    try {
+      const orgId = req.tenant!.id;
+      const id = parseInt(req.params.id, 10);
+      if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid patient id" });
+
+      const body = z.object({
+        userId: z.number(),
+        firstName: z.string().trim().min(1).optional(),
+        lastName: z.string().trim().min(1).optional(),
+        dateOfBirth: z.string().optional().nullable(),
+        genderAtBirth: z.string().optional().nullable(),
+        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
+      }).parse(req.body);
+
+      const patient = await storage.getPatient(id, orgId);
+      if (!patient) return res.status(404).json({ error: "Patient not found" });
+      if (patient.userId !== body.userId) return res.status(403).json({ error: "Forbidden" });
+
+      const updated = await storage.updatePatient(id, orgId, {
+        ...(body.firstName ? { firstName: body.firstName } : {}),
+        ...(body.lastName ? { lastName: body.lastName } : {}),
+        ...(body.dateOfBirth !== undefined ? { dateOfBirth: body.dateOfBirth ? (body.dateOfBirth as any) : null } : {}),
+        ...(body.genderAtBirth !== undefined ? { genderAtBirth: body.genderAtBirth ?? null } : {}),
+        ...(body.relation !== undefined ? { relation: body.relation ?? null } : {}),
+      } as any);
+
+      return res.json(updated);
+    } catch (error: any) {
+      console.error("Family member patient update error:", error);
+      res.status(500).json({ error: error?.message || "Failed to update family member" });
+    }
+  });
+
+  // Family members: delete a patient row without deleting the linked user account (scoped by userId).
+  app.delete("/api/patients/family-member/:id", authMiddleware, requireRole(["admin"]), async (req: TenantRequest, res) => {
+    try {
+      const orgId = req.tenant!.id;
+      const id = parseInt(req.params.id, 10);
+      if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid patient id" });
+
+      const userId = parseInt(String(req.query.userId ?? ""), 10);
+      if (Number.isNaN(userId)) return res.status(400).json({ error: "userId is required" });
+
+      const patient = await storage.getPatient(id, orgId);
+      if (!patient) return res.status(404).json({ error: "Patient not found" });
+      if (patient.userId !== userId) return res.status(403).json({ error: "Forbidden" });
+
+      const ok = await storage.deletePatientRecordOnly(id, orgId);
+      if (!ok) return res.status(404).json({ error: "Failed to delete family member" });
+
+      return res.json({ success: true });
+    } catch (error: any) {
+      console.error("Family member patient deletion error:", error);
+      res.status(500).json({ error: error?.message || "Failed to delete family member" });
+    }
+  });
+
   // Check patient email availability - checks if email exists in patients, users, or organizations
 
   // Symptom Checker API endpoints

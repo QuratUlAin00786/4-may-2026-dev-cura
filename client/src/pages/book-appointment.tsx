@@ -73,6 +73,8 @@ export default function PublicBookAppointmentPage() {
     duration?: number;
   } | null>(null);
   const [redirectToLoginAfterEdit, setRedirectToLoginAfterEdit] = useState(false);
+  const [showRescheduleEmailSentDialog, setShowRescheduleEmailSentDialog] = useState(false);
+  const [rescheduleEmailRecipients, setRescheduleEmailRecipients] = useState<string[]>([]);
 
   const getNext15Minutes = (hhmm: string): string => {
     const [hhStr, mmStr] = hhmm.split(":");
@@ -653,10 +655,8 @@ export default function PublicBookAppointmentPage() {
               variant: "destructive",
             });
           } else {
-            toast({
-              title: "Reschedule email sent",
-              description: `Sent to: ${attempted.join(", ")}`,
-            });
+            setRescheduleEmailRecipients(attempted);
+            setShowRescheduleEmailSentDialog(true);
           }
         }
       }
@@ -1074,6 +1074,42 @@ export default function PublicBookAppointmentPage() {
               ) : (
                 "Reschedule"
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Reschedule email sent dialog */}
+      <Dialog open={showRescheduleEmailSentDialog} onOpenChange={setShowRescheduleEmailSentDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Reschedule Email Sent</DialogTitle>
+            <DialogDescription>
+              The rescheduled appointment email was sent successfully.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="text-sm space-y-2">
+            <div className="rounded-md border p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Recipients</div>
+              {rescheduleEmailRecipients.length > 0 ? (
+                <ul className="list-disc pl-5 space-y-1">
+                  {rescheduleEmailRecipients.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="text-muted-foreground">—</div>
+              )}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={() => {
+                setShowRescheduleEmailSentDialog(false);
+                setRescheduleEmailRecipients([]);
+              }}
+            >
+              OK
             </Button>
           </DialogFooter>
         </DialogContent>

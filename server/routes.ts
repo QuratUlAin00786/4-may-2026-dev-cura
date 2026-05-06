@@ -851,7 +851,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const sub = String(req.params.subdomain || "").trim();
       const appointmentId = String(req.params.appointmentId || "").trim();
-      const { email, phone, doctorId, date, time, appointmentType, duration, consultationId, treatmentId, description } = req.body || {};
+      const {
+        email,
+        phone,
+        doctorId,
+        date,
+        time,
+        status,
+        appointmentType,
+        duration,
+        consultationId,
+        treatmentId,
+        description,
+        // When rescheduling via public booking flow, include the newly-created appointment so we can email both sides.
+        newAppointmentId,
+        // Optional: explicitly trigger reschedule email after new booking exists.
+        sendRescheduleEmail,
+      } = req.body || {};
       if (!sub || !appointmentId) return res.status(400).json({ error: "Missing parameters" });
 
       const org = await storage.getOrganizationBySubdomain(sub);
@@ -867,6 +883,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 to_char(scheduled_at::timestamp, 'YYYY-MM-DD') AS scheduled_date,
                 to_char(scheduled_at::timestamp, 'HH24:MI') AS scheduled_time,
                 duration,
+                status,
                 appointment_type,
                 consultation_id,
                 treatment_id,
@@ -887,12 +904,215 @@ export async function registerRoutes(app: Express): Promise<Server> {
         (!!phone && patient?.phone && String(patient.phone).trim() === String(phone).trim());
       if (!matchesIdentity) return res.status(403).json({ error: "Identity verification failed" });
 
+      // Status-only update (no date/time) is allowed (used by public booking flow to "reschedule existing + book new").
+      // If caller supplies date+time, we treat it as a full reschedule and enforce overlap checks.
+      const nextStatus = status != null ? String(status).trim() : null;
+      const wantsScheduleChange = !!(date && time);
+      if (!wantsScheduleChange && nextStatus) {
+        const statusUpdate = await pool.query(
+          `UPDATE appointments
+           SET status = $1
+           WHERE organization_id = $2 AND appointment_id = $3
+           RETURNING appointment_id,
+                     status,
+                     scheduled_at::text as scheduled_at,
+                     to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                     to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                     duration,
+                     provider_id`,
+          [nextStatus, organizationId, appointmentId],
+        );
+        const updated = statusUpdate.rows?.[0] || null;
+
+        // If this is a reschedule action, email patient + provider with old/new details.
+        let rescheduleEmailResult: any = null;
+        try {
+          const stNorm = String(nextStatus || "")
+            .toLowerCase()
+            .trim()
+            .replace(/\s+/g, "_");
+          const shouldSendRescheduleEmail =
+            stNorm === "rescheduled" &&
+            (sendRescheduleEmail === true || sendRescheduleEmail === "true" || !!newAppointmentId);
+
+          if (shouldSendRescheduleEmail) {
+            console.log("[PUBLIC-APPOINTMENT] reschedule email gate", {
+              appointmentId,
+              newAppointmentId: newAppointmentId ?? null,
+              sendRescheduleEmail: sendRescheduleEmail ?? null,
+              patientEmail: patient?.email ? String(patient.email).trim() : (email ? String(email).trim() : ""),
+              providerId: existing?.provider_id ?? null,
+            });
+            const formatTime12h = (hhmm: any): string => {
+              const s = String(hhmm ?? "").trim();
+              const m = s.match(/^(\d{1,2}):(\d{2})$/);
+              if (!m) return s || "—";
+              let h = parseInt(m[1], 10);
+              const min = m[2];
+              if (Number.isNaN(h)) return s || "—";
+              const ampm = h >= 12 ? "PM" : "AM";
+              h = h % 12;
+              if (h === 0) h = 12;
+              return `${String(h).padStart(2, "0")}:${min} ${ampm}`;
+            };
+
+            const patientEmail = patient?.email ? String(patient.email).trim() : (email ? String(email).trim() : "");
+            const providerRow = await pool.query(
+              `SELECT first_name, last_name, email
+               FROM users
+               WHERE organization_id = $1 AND id = $2
+               LIMIT 1`,
+              [organizationId, Number(existing.provider_id)],
+            );
+            const provider = providerRow.rows?.[0] || null;
+            const providerEmail = provider?.email ? String(provider.email).trim() : "";
+            const providerName =
+              provider ? `${provider.first_name ?? ""} ${provider.last_name ?? ""}`.trim() : "";
+
+            // Load the newly-created appointment if provided so we can include exact new details.
+            let newApt: any = null;
+            const newId = newAppointmentId != null ? String(newAppointmentId).trim() : "";
+            if (newId) {
+              const newRes = await pool.query(
+                `SELECT appointment_id,
+                        provider_id,
+                        scheduled_at::text as scheduled_at,
+                        to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                        to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                        duration,
+                        appointment_type,
+                        consultation_id,
+                        treatment_id
+                 FROM appointments
+                 WHERE organization_id = $1 AND appointment_id = $2
+                 LIMIT 1`,
+                [organizationId, newId],
+              );
+              if (newRes.rows?.length) newApt = newRes.rows[0];
+            }
+
+            const clinicName = (org as any)?.brandName || (org as any)?.name || "Clinic";
+            const patientName =
+              `${patient?.firstName ?? ""} ${patient?.lastName ?? ""}`.trim() || "Patient";
+
+            const oldDate = existing?.scheduled_date || "—";
+            const oldTime = formatTime12h(existing?.scheduled_time);
+            const oldDuration = existing?.duration ?? "—";
+            const oldType = existing?.appointment_type || "appointment";
+
+            const newDate = newApt?.scheduled_date || "—";
+            const newTime = formatTime12h(newApt?.scheduled_time);
+            const newDuration = newApt?.duration ?? "—";
+            const newType = newApt?.appointment_type || "appointment";
+            const newAppointmentIdText = newApt?.appointment_id ? String(newApt.appointment_id) : "—";
+
+            const subject = `Appointment Updated Successfully (${appointmentId}) - ${clinicName}`;
+            const text = `Hello ${patientName},
+
+Your appointment has been updated.
+
+Appointment ID (previous): ${appointmentId}
+Appointment ID (new): ${newAppointmentIdText}
+Type: ${newType || oldType}
+
+Previous:
+- Date: ${oldDate}
+- Time: ${oldTime}
+- Duration: ${oldDuration} minutes
+- Doctor: ${providerName || String(existing.provider_id)}
+
+Updated:
+- Date: ${newDate}
+- Time: ${newTime}
+- Duration: ${newDuration} minutes
+- Doctor: ${providerName || String(existing.provider_id)}
+
+If you did not request this change, please contact ${clinicName}.`;
+
+            // Match the "Appointment Updated Successfully" layout (previous vs updated).
+            const html = `
+<!doctype html>
+<html>
+  <body style="margin:0; padding:0; font-family: Arial, sans-serif; background:#f5f5f5;">
+    <div style="max-width:760px; margin:0 auto; background:#ffffff; padding:24px;">
+      <h2 style="margin:0 0 10px 0; color:#111827;">Appointment Updated Successfully</h2>
+      <p style="margin:0 0 16px 0; color:#374151;">Hello <strong>${patientName}</strong>, your appointment has been updated.</p>
+
+      <div style="border:1px solid #E5E7EB; border-radius:12px; overflow:hidden; margin: 16px 0;">
+        <div style="background:#EEF2FF; padding:12px 14px; font-weight:700; color:#3730A3;">Appointment Details</div>
+        <div style="padding:14px; color:#111827;">
+          <div style="margin-bottom:6px;"><strong>Previous Appointment ID:</strong> ${appointmentId}</div>
+          <div style="margin-bottom:6px;"><strong>New Appointment ID:</strong> ${newAppointmentIdText}</div>
+          <div><strong>Type:</strong> ${newType || oldType}</div>
+        </div>
+      </div>
+
+      <div style="display:flex; gap:14px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:280px; border:1px solid #E5E7EB; border-radius:12px; padding:14px;">
+          <div style="font-weight:700; color:#111827; margin-bottom:10px;">Previous</div>
+          <div style="color:#374151;"><strong>Date:</strong> ${oldDate}</div>
+          <div style="color:#374151;"><strong>Time:</strong> ${oldTime}</div>
+          <div style="color:#374151;"><strong>Duration:</strong> ${oldDuration} minutes</div>
+          <div style="color:#374151;"><strong>Doctor:</strong> ${providerName || String(existing.provider_id)}</div>
+        </div>
+
+        <div style="flex:1; min-width:280px; border:1px solid #E5E7EB; border-radius:12px; padding:14px;">
+          <div style="font-weight:700; color:#111827; margin-bottom:10px;">Updated</div>
+          <div style="color:#374151;"><strong>Date:</strong> ${newDate}</div>
+          <div style="color:#374151;"><strong>Time:</strong> ${newTime}</div>
+          <div style="color:#374151;"><strong>Duration:</strong> ${newDuration} minutes</div>
+          <div style="color:#374151;"><strong>Doctor:</strong> ${providerName || String(existing.provider_id)}</div>
+        </div>
+      </div>
+
+      <p style="margin:18px 0 0 0; color:#6B7280; font-size:13px; line-height:1.6;">
+        If you did not request this change, please contact <strong>${clinicName}</strong>.
+      </p>
+    </div>
+  </body>
+</html>`;
+
+            const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || "noreply@curaemr.ai";
+            const recipients = Array.from(
+              new Set([patientEmail, providerEmail].map((x) => String(x || "").trim()).filter(Boolean)),
+            );
+            console.log("[PUBLIC-APPOINTMENT] sending reschedule email", {
+              appointmentId,
+              newAppointmentId: newAppointmentIdText,
+              recipients,
+              subject,
+            });
+            const results = await Promise.allSettled(
+              recipients.map((to) => emailService.sendEmail({ to, from, subject, text, html })),
+            );
+            rescheduleEmailResult = {
+              attempted: recipients,
+              results: results.map((r) => (r.status === "fulfilled" ? { ok: true, value: r.value } : { ok: false, reason: String(r.reason ?? "") })),
+            };
+          }
+        } catch (mailErr) {
+          console.warn("[PUBLIC-APPOINTMENT] Reschedule email failed:", mailErr);
+          rescheduleEmailResult = {
+            attempted: [],
+            results: [{ ok: false, reason: String((mailErr as any)?.message || mailErr) }],
+          };
+        }
+
+        return res.json({ success: true, appointmentId, updated, rescheduleEmail: rescheduleEmailResult });
+      }
+
+      const normalizeStatus = (v: any): string | null => {
+        if (v == null) return null;
+        const s = String(v).trim().toLowerCase().replace(/\s+/g, "_");
+        return s || null;
+      };
       const nextDoctorId = doctorId != null ? Number(doctorId) : existing.provider_id;
       const nextDuration = duration != null ? Math.max(15, Number(duration)) : existing.duration;
       const nextType = appointmentType ? String(appointmentType) : existing.appointment_type;
       const nextConsultationId = nextType.toLowerCase() === "consultation" ? (consultationId != null ? Number(consultationId) : existing.consultation_id) : null;
       const nextTreatmentId = nextType.toLowerCase() === "treatment" ? (treatmentId != null ? Number(treatmentId) : existing.treatment_id) : null;
       const nextDescription = description != null ? String(description).trim() : existing.description;
+      const nextStatusFull = normalizeStatus(status);
 
       // Compute next scheduled_at from date + time ("HH:mm" or "hh:mm AM/PM")
       let nextScheduledAt: string = String(existing.scheduled_at);
@@ -943,7 +1163,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
          WHERE organization_id = $1
            AND provider_id = $2
            AND appointment_id <> $3
-           AND status <> 'cancelled'
+           AND LOWER(TRIM(COALESCE(status::text, ''))) NOT IN ('cancelled', 'canceled', 'rescheduled')
            AND (
              scheduled_at < ($4::timestamp + (($5::int || ' minutes')::interval))
              AND (scheduled_at + ((COALESCE(duration, 30)::int || ' minutes')::interval)) > $4::timestamp
@@ -961,9 +1181,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
              duration = $4,
              consultation_id = $5,
              treatment_id = $6,
-             description = $7
-         WHERE organization_id = $8 AND id = $9 AND appointment_id = $10
+             description = $7,
+             status = COALESCE($8, status)
+         WHERE organization_id = $9 AND id = $10 AND appointment_id = $11
          RETURNING appointment_id,
+                  status,
                    scheduled_at::text as scheduled_at,
                    to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
                    to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
@@ -977,6 +1199,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           nextConsultationId,
           nextTreatmentId,
           nextDescription,
+          nextStatusFull,
           organizationId,
           appointmentDbId,
           appointmentId,
@@ -6635,6 +6858,41 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           const aptDate = new Date(apt.scheduledAt);
           return aptDate >= startDate && aptDate <= endDate;
         });
+      }
+
+      // Persist in_progress using the same wall-clock window as Node uses for responses.
+      // Catches cases where SQL NOW() vs naive scheduled_at comparison differs from JS Date.
+      try {
+        const nowJs = new Date();
+        const promotedIds = new Set<number>();
+        const tasks: Promise<unknown>[] = [];
+        for (const apt of appointments as any[]) {
+          const st = String(apt?.status ?? "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, "_");
+          if (st !== "scheduled" && st !== "confirmed") continue;
+          const startAt = new Date(apt?.scheduledAt);
+          if (Number.isNaN(startAt.getTime())) continue;
+          const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+          const endAt = new Date(startAt.getTime() + dur * 60 * 1000);
+          const id = Number(apt?.id);
+          if (!Number.isFinite(id)) continue;
+          if (startAt <= nowJs && nowJs < endAt && !promotedIds.has(id)) {
+            promotedIds.add(id);
+            tasks.push(
+              storage.updateAppointment(id, organizationId, { status: "in_progress" } as any),
+            );
+          }
+        }
+        if (tasks.length > 0) {
+          await Promise.allSettled(tasks.slice(0, 100));
+          appointments = (appointments as any[]).map((apt: any) =>
+            promotedIds.has(Number(apt?.id)) ? { ...apt, status: "in_progress" } : apt,
+          ) as any;
+        }
+      } catch (e) {
+        console.warn("[APPOINTMENTS] JS in_progress persist:", e);
       }
 
       // Dynamic in_progress for ongoing appointments (response / UI consistency)
@@ -17213,7 +17471,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
          FROM appointments
          WHERE organization_id = $1
            AND provider_id = $2
-           AND status <> 'cancelled'
+           AND LOWER(TRIM(COALESCE(status::text, ''))) NOT IN ('cancelled', 'canceled', 'rescheduled')
            AND DATE(scheduled_at::timestamp) = $3::date
            AND ($4::text = '' OR appointment_id::text <> $4::text)`,
         [organizationId, doctorId, date, excludeAppointmentId]
@@ -17464,7 +17722,25 @@ This treatment plan should be reviewed and adjusted based on individual patient 
   app.post("/api/public/:subdomain/appointments", async (req: TenantRequest, res) => {
     try {
       const sub = String(req.params.subdomain || "").trim();
-      const { name, phone, email, doctorId, date, time, token, appointmentType, duration, consultationId, treatmentId, description } = req.body || {};
+      const {
+        name,
+        phone,
+        email,
+        doctorId,
+        date,
+        time,
+        token,
+        appointmentType,
+        duration,
+        consultationId,
+        treatmentId,
+        description,
+        // When creating a new appointment as part of a "reschedule", we do NOT want to send a separate
+        // confirmation email; the reschedule email will include both old + new appointment details.
+        suppressConfirmationEmail,
+        // Alternative marker for reschedule flows (more robust than a boolean flag).
+        rescheduleOfAppointmentId,
+      } = req.body || {};
       if (!sub) return res.status(400).json({ error: "Missing subdomain" });
       if (!name || !phone || !doctorId || !date || !time) {
         return res.status(400).json({ error: "Missing required fields" });
@@ -17528,7 +17804,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
          FROM appointments
          WHERE organization_id = $1
            AND provider_id = $2
-           AND status <> 'cancelled'
+           AND LOWER(TRIM(COALESCE(status::text, ''))) NOT IN ('cancelled', 'canceled', 'rescheduled')
            AND (
              scheduled_at < ($3::timestamp + (($4::int || ' minutes')::interval))
              AND (scheduled_at + ((COALESCE(duration, 30)::int || ' minutes')::interval)) > $3::timestamp
@@ -17856,9 +18132,20 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         );
       }
 
-      // Send booking confirmation email to guest if an email was provided.
+      // Send booking confirmation email to guest (and provider) if an email was provided.
       const recipientEmail = String(email || "").trim();
-      if (recipientEmail) {
+      const suppressConfirm =
+        suppressConfirmationEmail === true ||
+        suppressConfirmationEmail === "true" ||
+        (rescheduleOfAppointmentId != null && String(rescheduleOfAppointmentId).trim() !== "");
+      console.log("[PUBLIC-APPOINTMENT] confirmation email gate", {
+        apptId,
+        recipientEmail: recipientEmail || null,
+        suppressConfirmationEmail: suppressConfirmationEmail ?? null,
+        rescheduleOfAppointmentId: rescheduleOfAppointmentId ?? null,
+        suppressConfirm,
+      });
+      if (recipientEmail && !suppressConfirm) {
         try {
           const clinicHeader = await storage.getActiveClinicHeader(organizationId);
           const clinicFooter = await storage.getActiveClinicFooter(organizationId);
@@ -17902,10 +18189,12 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           const typeLabel = String(appointmentType || "consultation");
           const durationLabel = `${durationMins} minutes`;
 
-          await emailService.sendEmail({
-            to: recipientEmail,
-            subject: `Appointment Confirmation - ${apptId}`,
-            html: generateAppointmentConfirmationEmailHTML({
+          const doctorEmail = doctor?.email ? String(doctor.email).trim() : "";
+          const recipients = Array.from(
+            new Set([recipientEmail, doctorEmail].map((x) => String(x || "").trim()).filter(Boolean)),
+          );
+          const subject = `Appointment Confirmation - ${apptId}`;
+          const html = generateAppointmentConfirmationEmailHTML({
               visitorName: String(name || "Qura-visitor").trim(),
               appointmentId: apptId,
               patientId: guestPatientCode,
@@ -17918,22 +18207,26 @@ This treatment plan should be reviewed and adjusted based on individual patient 
               durationLabel,
               clinicHeader,
               clinicFooter,
-            }),
-            text:
-              `Hello ${String(name || "Qura-visitor").trim()},\n\n` +
-              `Your appointment has been booked successfully.\n\n` +
-              `Appointment Summary\n` +
-              `- Appointment ID: ${apptId}\n` +
-              `- Patient ID: ${guestPatientCode || "—"}\n` +
-              `- Clinic: ${(org as any)?.name || sub}\n` +
-              `- Doctor: ${doctorName}\n` +
-              `- Type: ${typeLabel}\n` +
-              `- Service: ${serviceLabel}\n` +
-              `- Date: ${appointmentDate}\n` +
-              `- Time: ${appointmentTime}\n` +
-              `- Duration: ${durationLabel}\n\n` +
-              `If you need to make changes, please contact the clinic.`
-          });
+            });
+          const text =
+            `Hello ${String(name || "Qura-visitor").trim()},\n\n` +
+            `Your appointment has been booked successfully.\n\n` +
+            `Appointment Summary\n` +
+            `- Appointment ID: ${apptId}\n` +
+            `- Patient ID: ${guestPatientCode || "—"}\n` +
+            `- Clinic: ${(org as any)?.name || sub}\n` +
+            `- Doctor: ${doctorName}\n` +
+            `- Type: ${typeLabel}\n` +
+            `- Service: ${serviceLabel}\n` +
+            `- Date: ${appointmentDate}\n` +
+            `- Time: ${appointmentTime}\n` +
+            `- Duration: ${durationLabel}\n\n` +
+            `If you need to make changes, please contact the clinic.`;
+          const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || "noreply@curaemr.ai";
+          for (const to of recipients) {
+            console.log("[PUBLIC-APPOINTMENT] sending confirmation email", { apptId, to, subject });
+            await emailService.sendEmail({ to, from, subject, html, text });
+          }
         } catch (mailErr) {
           console.warn("[PUBLIC-APPOINTMENT] Confirmation email failed:", mailErr);
         }
@@ -17998,6 +18291,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
                   appointment_type,
                   consultation_id,
                   treatment_id,
+                  (SELECT name FROM treatments t WHERE t.organization_id = $1 AND t.id = appointments.treatment_id LIMIT 1) as service_name,
                   description
            FROM appointments
            WHERE organization_id = $1
@@ -18022,6 +18316,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
                   appointment_type,
                   consultation_id,
                   treatment_id,
+                  (SELECT service_name FROM doctors_fee df WHERE df.organization_id = $1 AND df.id = appointments.consultation_id LIMIT 1) as service_name,
                   description
            FROM appointments
            WHERE organization_id = $1
@@ -18046,6 +18341,11 @@ This treatment plan should be reviewed and adjusted based on individual patient 
                   appointment_type,
                   consultation_id,
                   treatment_id,
+                  CASE
+                    WHEN appointment_type = 'treatment' THEN (SELECT name FROM treatments t WHERE t.organization_id = $1 AND t.id = appointments.treatment_id LIMIT 1)
+                    WHEN appointment_type = 'consultation' THEN (SELECT service_name FROM doctors_fee df WHERE df.organization_id = $1 AND df.id = appointments.consultation_id LIMIT 1)
+                    ELSE NULL
+                  END as service_name,
                   description
            FROM appointments
            WHERE organization_id = $1

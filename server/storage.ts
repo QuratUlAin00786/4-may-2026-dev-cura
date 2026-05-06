@@ -1883,13 +1883,14 @@ export class DatabaseStorage implements IStorage {
 
   async promoteOngoingAppointmentsToInProgress(organizationId: number): Promise<void> {
     try {
+      // interval * integer is the portable PG form; avoids ambiguous (int * interval) in some versions.
       await db.execute(sql`
         UPDATE appointments
         SET status = 'in_progress'
         WHERE organization_id = ${organizationId}
         AND LOWER(TRIM(status)) IN ('scheduled', 'confirmed')
         AND scheduled_at <= NOW()
-        AND scheduled_at + (COALESCE(duration, 30) * interval '1 minute') > NOW()
+        AND scheduled_at + (interval '1 minute' * COALESCE(NULLIF(duration, 0), 30)) > NOW()
       `);
     } catch (error) {
       console.warn("[STORAGE] promoteOngoingAppointmentsToInProgress failed:", error);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -2716,6 +2716,59 @@ Medical License: [License Number]
       ),
     [selectedDateAppointments, nowForCardStyle],
   );
+
+  /** Admin: persist "ongoing" (time window) as `in_progress`, aligned with card time logic (not only server SQL/UTC). */
+  const adminAutoPromoteOngoingLockRef = useRef(new Set<number>());
+  useEffect(() => {
+    if (user?.role !== "admin") return;
+    if (!Array.isArray(appointments) || appointments.length === 0) return;
+    const now = nowForCardStyle;
+
+    for (const id of [...adminAutoPromoteOngoingLockRef.current]) {
+      const apt = appointments.find((a: any) => Number(a.id) === id);
+      if (!apt) {
+        adminAutoPromoteOngoingLockRef.current.delete(id);
+        continue;
+      }
+      const st = String(apt?.status ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, "_");
+      const kind = getAppointmentCardTimeKind(apt, now, parseScheduledAtAsLocal);
+      if (st === "in_progress" || kind !== "ongoing") {
+        adminAutoPromoteOngoingLockRef.current.delete(id);
+      }
+    }
+
+    for (const apt of appointments) {
+      const id = Number(apt?.id);
+      if (!Number.isFinite(id)) continue;
+      const st = String(apt?.status ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, "_");
+      if (st !== "scheduled" && st !== "confirmed") continue;
+      if (getAppointmentCardTimeKind(apt, now, parseScheduledAtAsLocal) !== "ongoing") continue;
+      if (adminAutoPromoteOngoingLockRef.current.has(id)) continue;
+
+      adminAutoPromoteOngoingLockRef.current.add(id);
+      void (async () => {
+        try {
+          const response = await apiRequest("PATCH", `/api/appointments/${id}`, {
+            status: "in_progress",
+          });
+          if (!response.ok) {
+            const t = await response.text();
+            throw new Error(t || response.statusText);
+          }
+          await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+        } catch (e) {
+          console.warn("[Calendar] Admin auto-promote ongoing → in_progress failed:", e);
+          adminAutoPromoteOngoingLockRef.current.delete(id);
+        }
+      })();
+    }
+  }, [user?.role, appointments, nowForCardStyle, queryClient]);
 
   const nextUpcomingAppointmentId = useMemo(() => {
     // "Next" only applies when viewing today's schedule, not a future (or past) calendar date.

@@ -11,6 +11,7 @@ import { useToast } from "@/hooks/use-toast";
 import { format } from "date-fns";
 import { Textarea } from "@/components/ui/textarea";
 import { Calendar as CalendarComponent } from "@/components/ui/calendar";
+import { Loader2 } from "lucide-react";
 
 function getSubdomainFromPath(pathname: string): string | null {
   const parts = pathname.split("/").filter(Boolean);
@@ -148,34 +149,8 @@ export default function PublicBookAppointmentPage() {
     return new Date(y, mo - 1, d, 0, 0, 0, 0);
   };
 
-  const checkDuplicateForDate = async (targetDate: string) => {
-    if (!subdomain || !doctorId || !targetDate) return;
-    if (!email.trim() && !phone.trim()) return;
-    try {
-      const precheckPayload = {
-        name: name.trim(),
-        phone: phone.trim(),
-        email: email.trim() || null,
-        doctorId: doctorId ? Number(doctorId) : null,
-        date: targetDate,
-      };
-      const res = await apiRequest("POST", `/api/public/${encodeURIComponent(subdomain)}/appointments/check-duplicate`, precheckPayload);
-      const ct = res.headers.get("content-type") || "";
-      const data = ct.includes("application/json") ? await res.json() : null;
-
-      // 409 is expected when a duplicate exists. Treat as "duplicate found", not an exception case.
-      if (res.status === 409 || data?.duplicate || String(data?.code || "").includes("DUPLICATE_PATIENT_SAME_DAY")) {
-        setDuplicationData(data);
-        setShowDuplicationDialog(true);
-        return;
-      }
-    } catch (err: any) {
-      const msg = String(err?.message || "").toUpperCase();
-      if (msg.includes("DUPLICATE_PATIENT_SAME_DAY") || msg.includes("409")) {
-        setShowDuplicationDialog(true);
-      }
-    }
-  };
+  // Duplicate check is performed only on "Book Appointment" click (handleSubmit),
+  // so the popup always reflects the chosen service + time slot.
 
   useEffect(() => {
     let cancelled = false;
@@ -389,6 +364,64 @@ export default function PublicBookAppointmentPage() {
     return Object.keys(next).length === 0;
   };
 
+  const ensureCanCreateNewAppointmentOrToast = (): boolean => {
+    // Use the same validation rules as the normal booking button.
+    setHasSubmitted(true);
+    const ok = validate();
+    if (!ok) {
+      toast({
+        title: "Missing details",
+        description: "Please select a valid date/time and service before continuing.",
+        variant: "destructive",
+      });
+    }
+    return ok;
+  };
+
+  const ensurePublicIdentityOrToast = (): boolean => {
+    // Public PATCH requires email or phone for identity verification.
+    const hasEmail = !!email.trim();
+    const hasPhone = !!phone.trim();
+    if (hasEmail || hasPhone) return true;
+    toast({
+      title: "Missing contact details",
+      description: "Please enter your email or phone to update an existing appointment.",
+      variant: "destructive",
+    });
+    return false;
+  };
+
+  const resetBookingForm = () => {
+    // Clear validation + transient UI state so the form is clean for the next booking.
+    setHasSubmitted(false);
+    setErrors({});
+    setSlotConflictMessage("");
+    setDuplicationData(null);
+    setShowDuplicationDialog(false);
+    setShowSummaryDialog(false);
+    setShowEditExistingDialog(false);
+    setShowEditSummaryDialog(false);
+    setEditSummary(null);
+    setRedirectToLoginAfterEdit(false);
+    setIsSavingEdit(false);
+
+    setName("");
+    setPhone("");
+    setEmail("");
+    setRole("");
+    setDoctorId("");
+    setDate("");
+    setTime("");
+    setAppointmentType("");
+    setServiceId("");
+    setDescription("");
+    setDuration("30");
+
+    setAvailableSlots([]);
+    setAllSlots([]);
+    setBookedSlots([]);
+  };
+
   const handleSubmit = () => {
     (async () => {
       if (!subdomain) {
@@ -406,11 +439,18 @@ export default function PublicBookAppointmentPage() {
           email: email.trim() || null,
           doctorId: doctorId ? Number(doctorId) : null,
           date,
+          appointmentType: appointmentType === "procedure" ? "treatment" : appointmentType,
+          treatmentId:
+            (appointmentType === "treatment" || appointmentType === "procedure") && serviceId
+              ? Number(serviceId)
+              : null,
+          consultationId:
+            appointmentType === "consultation" && serviceId ? Number(serviceId) : null,
         };
         if (precheckPayload.doctorId && date) {
           const res = await apiRequest("POST", `/api/public/${encodeURIComponent(subdomain)}/appointments/check-duplicate`, precheckPayload);
           const data = await res.json();
-          if (!res.ok && String(data?.code || "").includes("DUPLICATE_PATIENT_SAME_DAY")) {
+          if (!res.ok && (String(data?.code || "").includes("DUPLICATE_PATIENT_SAME_DAY") || String(data?.code || "").includes("DUPLICATE_APPOINTMENT_SERVICE"))) {
             setDuplicationData(data);
             setShowDuplicationDialog(true);
             return;
@@ -423,7 +463,7 @@ export default function PublicBookAppointmentPage() {
         }
       } catch (err: any) {
         const msg = String(err?.message || "").toUpperCase();
-        if (msg.includes("DUPLICATE_PATIENT_SAME_DAY") || msg.includes("409")) {
+        if (msg.includes("DUPLICATE_PATIENT_SAME_DAY") || msg.includes("DUPLICATE_APPOINTMENT_SERVICE") || msg.includes("409")) {
           // Show duplication dialog on any 409 from precheck
           try {
             const jsonStart = msg.indexOf("{");
@@ -439,14 +479,11 @@ export default function PublicBookAppointmentPage() {
     })();
   };
 
-  const handleConfirmBooking = async () => {
+  const createPublicAppointment = async (opts?: { suppressConfirmationEmail?: boolean; rescheduleOfAppointmentId?: string }) => {
     if (!subdomain) {
-      toast({ title: "Missing subdomain", description: "Invalid booking URL", variant: "destructive" });
-      return;
+      throw new Error("Invalid booking URL");
     }
-    setSubmitting(true);
-    try {
-      const payload = {
+    const payload = {
         name: name.trim(),
         phone: phone.trim(),
         email: email.trim() || null,
@@ -459,12 +496,27 @@ export default function PublicBookAppointmentPage() {
         treatmentId: appointmentType === "treatment" ? Number(serviceId) : null,
         token: tokenParam || null,
         description: description.trim() || null,
+        suppressConfirmationEmail: opts?.suppressConfirmationEmail === true,
+        rescheduleOfAppointmentId: opts?.rescheduleOfAppointmentId || null,
       };
-      const res = await apiRequest("POST", `/api/public/${encodeURIComponent(subdomain)}/appointments`, payload);
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || "Failed to book appointment");
-      }
+    const res = await apiRequest("POST", `/api/public/${encodeURIComponent(subdomain)}/appointments`, payload);
+    const data = await res.json();
+    if (!res.ok) {
+      // Include status code so callers can reliably detect 409 conflicts, etc.
+      const msg = data?.error || "Failed to book appointment";
+      throw new Error(`${res.status}: ${msg}`);
+    }
+    return data;
+  };
+
+  const handleConfirmBooking = async () => {
+    if (!subdomain) {
+      toast({ title: "Missing subdomain", description: "Invalid booking URL", variant: "destructive" });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const data = await createPublicAppointment();
       const selectedDoctor = doctors.find((d) => String(d.id) === doctorId)?.name || "Selected doctor";
       const selectedService = serviceOptions.find((s) => String(s.id) === serviceId)?.name || "Selected service";
       setBookedAppointment({
@@ -487,6 +539,8 @@ export default function PublicBookAppointmentPage() {
         description: "This clinic does not have online payment enabled for the selected service, so the appointment was booked without payment.",
       });
       setShowSuccessDialog(true);
+      // Clear the form immediately after a successful non-checkout booking.
+      resetBookingForm();
     } catch (e: any) {
       const message = String(e?.message || "Unable to book appointment");
       if (message.includes("409") || message.toLowerCase().includes("selected slot is unavailable")) {
@@ -518,6 +572,126 @@ export default function PublicBookAppointmentPage() {
         }
       }
       toast({ title: "Booking failed", description: e?.message || "Unable to book appointment", variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleReplaceExistingAppointment = async () => {
+    // Instead of updating the existing appointment (PATCHing date/time), we mark it as rescheduled
+    // and create a brand-new appointment with the currently selected service + slot.
+    if (!subdomain) {
+      toast({ title: "Missing subdomain", description: "Invalid booking URL", variant: "destructive" });
+      return;
+    }
+    const apptId = duplicationData?.existingAppointment?.appointment_id;
+    if (!apptId) {
+      toast({ title: "Missing appointment", description: "No existing appointment to reschedule.", variant: "destructive" });
+      return;
+    }
+    if (!ensurePublicIdentityOrToast()) return;
+    if (!ensureCanCreateNewAppointmentOrToast()) return;
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      // 1) Mark the existing appointment as rescheduled first.
+      // This is required because the public booking endpoint blocks same-service duplicates for scheduled/confirmed,
+      // so we must reschedule the existing record before creating the new one.
+      const rescheduleRes1 = await apiRequest(
+        "PATCH",
+        `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(String(apptId))}`,
+        {
+          email: email.trim() || null,
+          phone: phone.trim() || null,
+          status: "rescheduled",
+        },
+      );
+      const ct1 = rescheduleRes1.headers.get("content-type") || "";
+      const body1 = ct1.includes("application/json") ? await rescheduleRes1.json() : await rescheduleRes1.text();
+      if (!rescheduleRes1.ok) {
+        const msg = typeof body1 === "string" ? body1 : (body1?.error || "Failed to reschedule existing appointment");
+        throw new Error(msg);
+      }
+
+      // 2) Create the new appointment.
+      const data = await createPublicAppointment({ suppressConfirmationEmail: true, rescheduleOfAppointmentId: String(apptId) });
+      const createdAppointmentId = String(data?.appointmentId || "").trim();
+
+      // 3) Trigger reschedule notification email including both old + new appointment IDs/details.
+      if (createdAppointmentId) {
+        const rescheduleRes2 = await apiRequest(
+          "PATCH",
+          `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(String(apptId))}`,
+          {
+            email: email.trim() || null,
+            phone: phone.trim() || null,
+            status: "rescheduled",
+            newAppointmentId: createdAppointmentId,
+            sendRescheduleEmail: true,
+          },
+        );
+        const ct2 = rescheduleRes2.headers.get("content-type") || "";
+        const body2 = ct2.includes("application/json") ? await rescheduleRes2.json() : await rescheduleRes2.text();
+        if (!rescheduleRes2.ok) {
+          console.warn("[Public booking] reschedule email trigger failed:", body2);
+        } else {
+          const attempted = Array.isArray((body2 as any)?.rescheduleEmail?.attempted)
+            ? (body2 as any).rescheduleEmail.attempted
+            : [];
+          const results = Array.isArray((body2 as any)?.rescheduleEmail?.results)
+            ? (body2 as any).rescheduleEmail.results
+            : [];
+          const anyFailed = results.some((r: any) => r && r.ok === false);
+
+          // If backend didn't return diagnostics, treat as failure so we don't silently claim success.
+          const hasDiagnostics = "rescheduleEmail" in (body2 as any);
+
+          if (!hasDiagnostics || attempted.length === 0 || anyFailed) {
+            toast({
+              title: "Email not sent",
+              description: "Appointment was rescheduled, but email notification failed. Please contact the clinic.",
+              variant: "destructive",
+            });
+          } else {
+            toast({
+              title: "Reschedule email sent",
+              description: `Sent to: ${attempted.join(", ")}`,
+            });
+          }
+        }
+      }
+
+      // 4) Continue with the normal UI flow (checkout redirect or success dialog).
+      const selectedDoctor = doctors.find((d) => String(d.id) === doctorId)?.name || "Selected doctor";
+      const selectedService = serviceOptions.find((s) => String(s.id) === serviceId)?.name || "Selected service";
+      setBookedAppointment({
+        appointmentId: createdAppointmentId,
+        doctorName: selectedDoctor,
+        serviceName: selectedService,
+        date,
+        time,
+        duration,
+      });
+      setShowDuplicationDialog(false);
+      setShowSummaryDialog(false);
+      const checkoutUrl = String(data?.checkoutUrl || "").trim();
+      if (checkoutUrl) {
+        window.location.href = checkoutUrl;
+        return;
+      }
+      toast({
+        title: "Appointment rescheduled",
+        description: "The existing appointment was rescheduled and a new appointment was created.",
+      });
+      setShowSuccessDialog(true);
+      // Clear the form after reschedule+new booking (non-checkout).
+      resetBookingForm();
+    } catch (e: any) {
+      toast({
+        title: "Replace failed",
+        description: e?.message || "Unable to reschedule existing appointment and book a new one.",
+        variant: "destructive",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -732,8 +906,6 @@ export default function PublicBookAppointmentPage() {
                           if (!d) return;
                           const dateStr = dateToLocalYMD(d);
                           setDate(dateStr);
-                          // Immediate duplication check on selected date (same patient + same doctor + same day)
-                          setTimeout(() => { checkDuplicateForDate(dateStr); }, 0);
                           if (hasSubmitted) setTimeout(() => validate(), 0);
                         }}
                         disabled={(d) => {
@@ -860,49 +1032,48 @@ export default function PublicBookAppointmentPage() {
           <DialogHeader>
             <DialogTitle>Appointment duplication detected</DialogTitle>
             <DialogDescription>
-              This patient already has an appointment on the selected date.
+              An appointment already exists for the selected service. You can reschedule the existing one and book this new slot.
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-2 text-sm">
-            {duplicationData?.existingAppointment ? (
-              <div className="rounded-md border p-3">
-                <div><span className="font-medium">Appointment ID:</span> {duplicationData.existingAppointment.appointment_id}</div>
-                <div><span className="font-medium">Date:</span> {duplicationData.existingAppointment.scheduled_date || String(duplicationData.existingAppointment.scheduled_at).split("T")[0]}</div>
-                <div><span className="font-medium">Time:</span> {to12Hour(duplicationData.existingAppointment.scheduled_time || String(duplicationData.existingAppointment.scheduled_at).split("T")[1]?.slice(0,5))}</div>
-                <div><span className="font-medium">Duration:</span> {duplicationData.existingAppointment.duration} minutes</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+            <div className="rounded-md border p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Existing</div>
+              {duplicationData?.existingAppointment ? (
+                <div className="space-y-1">
+                  <div><span className="font-medium">Appointment ID:</span> {duplicationData.existingAppointment.appointment_id}</div>
+                  <div><span className="font-medium">Service:</span> {duplicationData.existingAppointment.service_name || "-"}</div>
+                  <div><span className="font-medium">Date:</span> {duplicationData.existingAppointment.scheduled_date || String(duplicationData.existingAppointment.scheduled_at).split("T")[0]}</div>
+                  <div><span className="font-medium">Time:</span> {to12Hour(duplicationData.existingAppointment.scheduled_time || String(duplicationData.existingAppointment.scheduled_at).split("T")[1]?.slice(0,5))}</div>
+                  <div><span className="font-medium">Duration:</span> {duplicationData.existingAppointment.duration} minutes</div>
+                </div>
+              ) : (
+                <div className="text-muted-foreground">No existing appointment details.</div>
+              )}
+            </div>
+            <div className="rounded-md border p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">New booking</div>
+              <div className="space-y-1">
+                <div><span className="font-medium">Service:</span> {serviceOptions.find((s) => String(s.id) === serviceId)?.name || "-"}</div>
+                <div><span className="font-medium">Date:</span> {date || "-"}</div>
+                <div><span className="font-medium">Time:</span> {to12Hour(time) || "-"}</div>
+                <div><span className="font-medium">Duration:</span> {duration || "-"} minutes</div>
               </div>
-            ) : null}
-            <p>Please choose to book another day or edit the existing appointment.</p>
+            </div>
           </div>
           <DialogFooter className="flex gap-3">
             <Button variant="secondary" onClick={() => setShowDuplicationDialog(false)}>Back</Button>
             <Button
-              onClick={() => {
-                if (!duplicationData?.existingAppointment) { setShowDuplicationDialog(false); return; }
-                const existing = duplicationData.existingAppointment;
-                if (existing.provider_id) setDoctorId(String(existing.provider_id));
-                const dt = new Date(existing.scheduled_at);
-                const y = dt.getFullYear();
-                const m = String(dt.getMonth() + 1).padStart(2, "0");
-                const d = String(dt.getDate()).padStart(2, "0");
-                const hh = String(dt.getHours()).padStart(2, "0");
-                const mm = String(dt.getMinutes()).padStart(2, "0");
-                const newDate = `${y}-${m}-${d}`;
-                const newTime = `${hh}:${mm}`;
-                setDate(newDate);
-                setTime(newTime);
-                setEditExistingDate(newDate);
-                // Clear selected time so the dialog highlights the current DB time (orange)
-                setEditExistingTime("");
-                if (existing.duration) setDuration(String(existing.duration));
-                if (existing.appointment_type) setAppointmentType(String(existing.appointment_type));
-                if (existing.consultation_id) setServiceId(String(existing.consultation_id));
-                if (existing.treatment_id) setServiceId(String(existing.treatment_id));
-                setShowDuplicationDialog(false);
-                setShowEditExistingDialog(true);
-              }}
+              disabled={submitting}
+              onClick={handleReplaceExistingAppointment}
             >
-              Update Appointment
+              {submitting ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Rescheduling…
+                </span>
+              ) : (
+                "Reschedule"
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1396,14 +1567,6 @@ export default function PublicBookAppointmentPage() {
             <Button
               onClick={() => {
                 setShowSuccessDialog(false);
-                setName("");
-                setPhone("");
-                setEmail("");
-                setDoctorId("");
-                setDate("");
-                setTime("");
-                setAppointmentType("");
-                setServiceId("");
                 setBookedAppointment(null);
                 toast({ title: "Success", description: "Appointment booked successfully." });
               }}

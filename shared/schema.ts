@@ -2693,7 +2693,7 @@ export const insertPatientSchema = createInsertSchema(patients).omit({
   firstName: z.string().trim().min(1, "First name is required"),
   lastName: z.string().trim().min(1, "Last name is required"),
   patientId: z.string().trim().min(1, "Patient ID is required"),
-  relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
+  relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other", "Dependent Child"]).optional().nullable(),
   dateOfBirth: z.coerce.date().nullable().optional(),
   email: z.string().trim().email("Please enter a valid email address").optional().or(z.literal("")),
   phone: z.string().trim().optional(),

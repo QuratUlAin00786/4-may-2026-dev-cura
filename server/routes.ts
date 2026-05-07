@@ -5093,12 +5093,19 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         lastName: z.string().trim().min(1),
         dateOfBirth: z.string().optional().nullable(),
         genderAtBirth: z.string().optional().nullable(),
-        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
+        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other", "Dependent Child"]).optional().nullable(),
       }).parse(req.body);
 
       // Generate patient ID (org scoped)
       const patientCount = await storage.getPatientsByOrganization(orgId, 999999);
       const patientId = `P${(patientCount.length + 1).toString().padStart(6, '0')}`;
+
+      // Store the same email as the linked user account, so all patient profiles under this userId share it.
+      const userRow = await pool.query(
+        `SELECT email FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+        [body.userId, orgId],
+      );
+      const linkedUserEmail = String(userRow.rows[0]?.email ?? "").trim() || null;
 
       const created = await storage.createPatient({
         organizationId: orgId,
@@ -5109,7 +5116,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         relation: body.relation ?? "Other",
         dateOfBirth: body.dateOfBirth ? (body.dateOfBirth as any) : null,
         genderAtBirth: body.genderAtBirth ?? null,
-        email: null,
+        email: linkedUserEmail,
         phone: null,
         nhsNumber: null,
         address: {},
@@ -5144,7 +5151,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         lastName: z.string().trim().min(1).optional(),
         dateOfBirth: z.string().optional().nullable(),
         genderAtBirth: z.string().optional().nullable(),
-        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"]).optional().nullable(),
+        relation: z.enum(["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other", "Dependent Child"]).optional().nullable(),
       }).parse(req.body);
 
       const patient = await storage.getPatient(id, orgId);
@@ -6952,18 +6959,45 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           appointments = await storage.getAppointmentsByProvider(userId, organizationId);
         }
       } else if (userRole === 'patient') {
-        // Patients can only see their own appointments
-        // Find the patient record by email (since userId may be null)
+        // Patients see appointments for their profile(s). When the account holder's patient row
+        // matches both `user_id` and `users.email`, include every patient profile with the same `user_id`
+        // (e.g. Self + family members on the same account).
         const patients = await storage.getPatientsByOrganization(organizationId, 100);
-        const user = req.user! as any; // Cast to access firstName/lastName properties
+        const authUser = req.user! as any;
 
-        // Match by email first (primary method), fallback to userId
-        const patient = patients.find(p => p.email === user.email) || patients.find(p => p.userId === userId);
+        const normalizePatientEmail = (e: string | null | undefined) =>
+          String(e ?? "").trim().toLowerCase();
+        const uEmail = normalizePatientEmail(authUser.email);
 
-        if (patient) {
-          appointments = await storage.getAppointmentsByPatient(patient.id, organizationId);
+        const linkedByUserAndEmail = patients.find(
+          (p) => p.userId === userId && normalizePatientEmail(p.email) === uEmail,
+        );
+
+        if (linkedByUserAndEmail?.userId != null) {
+          const familyPatientIds = patients
+            .filter((p) => p.userId === linkedByUserAndEmail.userId)
+            .map((p) => p.id);
+          const lists = await Promise.all(
+            familyPatientIds.map((id) => storage.getAppointmentsByPatient(id, organizationId)),
+          );
+          appointments = lists.flat();
+          const seen = new Set<number>();
+          appointments = appointments.filter((apt) => {
+            if (seen.has(apt.id)) return false;
+            seen.add(apt.id);
+            return true;
+          });
         } else {
-          appointments = [];
+          // Match by email first, fallback to userId (legacy / partial linkage)
+          const patient =
+            patients.find((p) => normalizePatientEmail(p.email) === uEmail) ||
+            patients.find((p) => p.userId === userId);
+
+          if (patient) {
+            appointments = await storage.getAppointmentsByPatient(patient.id, organizationId);
+          } else {
+            appointments = [];
+          }
         }
       } else if (userRole === 'nurse') {
         // Nurses see only their own appointments (where they are the provider)

@@ -140,6 +140,9 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   const [editAppointmentTypeError, setEditAppointmentTypeError] = useState<string>("");
   const [editTreatmentSelectionError, setEditTreatmentSelectionError] = useState<string>("");
   const [editConsultationSelectionError, setEditConsultationSelectionError] = useState<string>("");
+  const [showShareBookingDialog, setShowShareBookingDialog] = useState(false);
+  const [shareBookingEmail, setShareBookingEmail] = useState("");
+  const [isSharingBookingLink, setIsSharingBookingLink] = useState(false);
   
   const { user } = useAuth();
   const { toast } = useToast();
@@ -1343,8 +1346,87 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
             <Plus className="h-3 w-3" />
             Schedule Patient
           </Button>
+          {/* Share Booking Link (doctor/nurse) */}
+          {user && ["doctor", "nurse"].includes(String(user.role || "").toLowerCase()) && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowShareBookingDialog(true)}
+              data-testid="button-share-booking-link"
+            >
+              Share Booking Link
+            </Button>
+          )}
         </div>
       </div>
+
+      {/* Share Booking Link Dialog */}
+      <Dialog open={showShareBookingDialog} onOpenChange={setShowShareBookingDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Share Booking Link</DialogTitle>
+            <DialogDescription>
+              This link will be tied to your schedule and can be used once.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Patient Email</label>
+              <input
+                type="email"
+                className="w-full border rounded px-2 py-1 text-sm bg-background"
+                placeholder="patient@example.com"
+                value={shareBookingEmail}
+                onChange={(e) => setShareBookingEmail(e.target.value)}
+              />
+            </div>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setShowShareBookingDialog(false)} disabled={isSharingBookingLink}>
+              Cancel
+            </Button>
+            <Button
+              onClick={async () => {
+                if (!shareBookingEmail.trim()) {
+                  toast({ title: "Email required", description: "Please enter a valid patient email.", variant: "destructive" });
+                  return;
+                }
+                if (!user?.id) return;
+                setIsSharingBookingLink(true);
+                try {
+                  const payload: any = { email: shareBookingEmail.trim(), doctorId: Number(user.id) };
+                  const res = await apiRequest("POST", "/api/appointments/share-link", payload);
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(data?.error || "Failed to generate link");
+                  const fullLink = data.link?.startsWith("http") ? data.link : `${data.link}`;
+                  try {
+                    await navigator.clipboard.writeText(fullLink);
+                    toast({ title: "Link copied", description: "Booking link copied to clipboard and email sent." });
+                  } catch {
+                    toast({ title: "Link generated", description: fullLink });
+                  }
+                  setShowShareBookingDialog(false);
+                  setShareBookingEmail("");
+                } catch (e: any) {
+                  toast({ title: "Failed", description: e?.message || "Could not generate link", variant: "destructive" });
+                } finally {
+                  setIsSharingBookingLink(false);
+                }
+              }}
+              disabled={isSharingBookingLink}
+            >
+              {isSharingBookingLink ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Sending...
+                </span>
+              ) : (
+                "Send Link"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Appointment Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between bg-gray-100 dark:bg-gray-800 p-2 rounded-lg">

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1398,13 +1398,38 @@ export default function UserManagement() {
   const [roleNameError, setRoleNameError] = useState<string>("");
   const [roleDisplayNameError, setRoleDisplayNameError] = useState<string>("");
 
-  const relationOptions = ["Self", "Father", "Mother", "Son", "Daughter", "Spouse", "Other"] as const;
+  // For "Add Family Member" we only allow adding a dependent child profile.
+  const relationOptions = ["Dependent Child"] as const;
 
   const familyMemberSchema = z.object({
     fullName: z.string().trim().min(2, "Full name is required"),
     dateOfBirth: z.string().optional().nullable(),
     genderAtBirth: z.string().optional().nullable(),
-    relation: z.enum(relationOptions),
+    relation: z.literal("Dependent Child").default("Dependent Child"),
+  }).superRefine((val, ctx) => {
+    // Dependent Child must be under 18 years old.
+    const dobStr = String(val.dateOfBirth || "").trim();
+    if (!dobStr) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["dateOfBirth"], message: "Date of Birth is required for a dependent child" });
+      return;
+    }
+    const dob = new Date(`${dobStr}T00:00:00`);
+    if (Number.isNaN(dob.getTime())) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["dateOfBirth"], message: "Invalid Date of Birth" });
+      return;
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (dob > today) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["dateOfBirth"], message: "Date of Birth cannot be in the future" });
+      return;
+    }
+    const cutoff = new Date(today);
+    cutoff.setFullYear(cutoff.getFullYear() - 18);
+    // under 18 => DOB must be AFTER cutoff (strictly greater)
+    if (dob <= cutoff) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["dateOfBirth"], message: "Dependent child must be under 18 years old" });
+    }
   });
 
   type FamilyMemberFormData = z.infer<typeof familyMemberSchema>;
@@ -1419,7 +1444,7 @@ export default function UserManagement() {
       fullName: "",
       dateOfBirth: "",
       genderAtBirth: "",
-      relation: "Other",
+      relation: "Dependent Child",
     },
   });
 
@@ -1430,7 +1455,7 @@ export default function UserManagement() {
       fullName: "",
       dateOfBirth: "",
       genderAtBirth: "",
-      relation: "Other",
+      relation: "Dependent Child",
     });
     setFamilyModalOpen(true);
   };
@@ -1443,7 +1468,7 @@ export default function UserManagement() {
       fullName: "",
       dateOfBirth: "",
       genderAtBirth: "",
-      relation: "Other",
+      relation: "Dependent Child",
     });
   };
   
@@ -2130,6 +2155,83 @@ export default function UserManagement() {
     staleTime: 30000, // Keep data fresh for 30 seconds to prevent auto-refetch
   });
 
+  // Fetch patients (admin only) so patient users can show family profiles + relation badges
+  const { data: patientsTable = [] } = useQuery({
+    queryKey: ["/api/patients", "user-management"],
+    enabled: !!user && user.role === "admin" && activeTab === "users",
+    staleTime: 60000,
+    retry: false,
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/patients");
+      const data = await response.json();
+      return Array.isArray(data) ? data : [];
+    },
+  });
+
+  const normalizeEmailForGrouping = (e?: string | null) => String(e ?? "").trim().toLowerCase();
+  const patientRelationRank = (relation?: string | null) => {
+    const r = String(relation ?? "").trim().toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 1;
+    if (r === "dependent child") return 2;
+    return 10;
+  };
+  const patientProfileHierarchyForUser = useCallback(
+    (u: any): { main: any | null; children: any[] } => {
+      const list = Array.isArray(patientsTable) ? patientsTable : [];
+      const byUserId = list.filter((p: any) => p?.userId != null && Number(p.userId) === Number(u?.id));
+      const em = normalizeEmailForGrouping(u?.email);
+      const byEmail = em ? list.filter((p: any) => normalizeEmailForGrouping(p?.email) === em) : [];
+      const merged = [...byUserId, ...byEmail];
+      const seen = new Set<number>();
+      const uniq = merged.filter((p: any) => {
+        const id = Number(p?.id);
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+      const sorted = uniq.sort((a: any, b: any) => {
+        const d = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (d !== 0) return d;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+      const main =
+        sorted.find((p: any) => String(p?.relation ?? "").trim().toLowerCase() === "self") ?? sorted[0] ?? null;
+      const children = sorted.filter((p: any) => p !== main);
+      return { main, children };
+    },
+    [patientsTable],
+  );
+
+  /** Only the account holder (Self relation) can manage family members. */
+  const canShowAddFamilyMemberForUser = useCallback(
+    (u: any): boolean => {
+      if (!u || String(u.role || "").toLowerCase() !== "patient") return false;
+      const h = patientProfileHierarchyForUser(u);
+      const rel = String(h.main?.relation ?? "").trim().toLowerCase();
+      return rel === "self";
+    },
+    [patientProfileHierarchyForUser],
+  );
+
+  const displayNameForUserRow = useCallback(
+    (u: any): string => {
+      const fallback = `${u?.firstName || "N/A"} ${u?.lastName || "N/A"}`.trim();
+      if (!u || String(u.role || "").toLowerCase() !== "patient") return fallback;
+      const h = patientProfileHierarchyForUser(u);
+      const main = h.main;
+      const rel = String(main?.relation ?? "").trim().toLowerCase();
+      if (rel === "self") {
+        const n = `${main?.firstName || ""} ${main?.lastName || ""}`.trim();
+        return n || fallback;
+      }
+      return fallback;
+    },
+    [patientProfileHierarchyForUser],
+  );
+
   // Debug roles data
   console.log("Roles query - loading:", rolesLoading, "error:", rolesError, "roles count:", roles.length);
   if (rolesError) console.log("Roles error details:", rolesError);
@@ -2665,7 +2767,7 @@ export default function UserManagement() {
         lastName,
         dateOfBirth: data.dateOfBirth || null,
         genderAtBirth: data.genderAtBirth || null,
-        relation: data.relation,
+        relation: "Dependent Child",
       });
       return response.json();
     },
@@ -2676,7 +2778,7 @@ export default function UserManagement() {
         fullName: "",
         dateOfBirth: "",
         genderAtBirth: "",
-        relation: "Other",
+        relation: "Dependent Child",
       });
       toast({ title: "Family member added" });
     },
@@ -2705,7 +2807,7 @@ export default function UserManagement() {
         lastName,
         dateOfBirth: data.dateOfBirth || null,
         genderAtBirth: data.genderAtBirth || null,
-        relation: data.relation,
+        relation: "Dependent Child",
       });
       return response.json();
     },
@@ -2716,7 +2818,7 @@ export default function UserManagement() {
         fullName: "",
         dateOfBirth: "",
         genderAtBirth: "",
-        relation: "Other",
+        relation: "Dependent Child",
       });
       toast({ title: "Family member updated" });
     },
@@ -5252,10 +5354,10 @@ export default function UserManagement() {
                               <div className="flex items-center gap-2 min-w-0">
                                 <h3
                                   className="font-medium text-gray-900 dark:text-gray-100 truncate"
-                                  title={`${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim()}
+                                  title={displayNameForUserRow(user)}
                                 >
                                   {(() => {
-                                    const fullName = `${user.firstName || 'N/A'} ${user.lastName || 'N/A'}`.trim();
+                                    const fullName = displayNameForUserRow(user);
                                     return fullName.length > 20 ? fullName.slice(0, 20) + '...' : fullName;
                                   })()}
                                 </h3>
@@ -5283,6 +5385,41 @@ export default function UserManagement() {
                                   </Badge>
                                 )}
                               </p>
+                              {user.role === "patient" && (
+                                <div className="mt-2 space-y-1.5">
+                                  {(() => {
+                                    const h = patientProfileHierarchyForUser(user);
+                                    const main = h.main;
+                                    const children = h.children || [];
+                                    if (!main && children.length === 0) return null;
+                                    return (
+                                      <>
+                                        {main ? (
+                                          <div className="flex items-center gap-2">
+                                            <Badge variant="secondary" className="text-[10px] px-2 py-0.5">
+                                              {String(main.relation || "Self")}
+                                            </Badge>
+                                            <span className="text-xs text-gray-700 dark:text-gray-200 font-medium">
+                                              {`${main.firstName || ""} ${main.lastName || ""}`.trim() || "—"}
+                                            </span>
+                                          </div>
+                                        ) : null}
+                                        {children.map((p: any) => (
+                                          <div key={p.id} className="flex items-center gap-2 pl-4">
+                                            <span className="text-xs text-gray-400 dark:text-gray-500">↳</span>
+                                            <Badge variant="secondary" className="text-[10px] px-2 py-0.5">
+                                              {String(p.relation || "Other")}
+                                            </Badge>
+                                            <span className="text-xs text-gray-600 dark:text-gray-300">
+                                              {`${p.firstName || ""} ${p.lastName || ""}`.trim() || "—"}
+                                            </span>
+                                          </div>
+                                        ))}
+                                      </>
+                                    );
+                                  })()}
+                                </div>
+                              )}
                               {user.department && user.department.trim() && (
                                 <p className="text-xs text-gray-400 dark:text-gray-500">{user.department}</p>
                               )}
@@ -5324,7 +5461,7 @@ export default function UserManagement() {
                             )}
                             
                             <div className="flex items-center space-x-2">
-                              {user.role === "patient" && canManageRoles && (
+                              {user.role === "patient" && canManageRoles && canShowAddFamilyMemberForUser(user) && (
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -5454,7 +5591,7 @@ export default function UserManagement() {
                         <td className="px-4 py-3 text-gray-900 dark:text-gray-100">
                           <div className="flex items-center gap-2 min-w-0">
                             <span className="truncate">
-                              {user.firstName || "N/A"} {user.lastName || "N/A"}
+                              {displayNameForUserRow(user)}
                             </span>
                             {user.role === "patient" && (
                               <Badge variant={user.isActive ? "default" : "secondary"}>
@@ -5480,6 +5617,49 @@ export default function UserManagement() {
                               </Badge>
                             )}
                           </div>
+                          {user.role === "patient" && (
+                            <div className="mt-2 space-y-1.5">
+                              {(() => {
+                                const h = patientProfileHierarchyForUser(user);
+                                const main = h.main;
+                                const children = h.children || [];
+                                if (!main && children.length === 0) return null;
+                                return (
+                                  <>
+                                    {main ? (
+                                      <div className="flex items-center gap-2">
+                                        <Badge
+                                          variant="secondary"
+                                          className="text-[10px] px-2 py-0.5"
+                                          title={`${main.firstName || ""} ${main.lastName || ""}`.trim()}
+                                        >
+                                          {String(main.relation || "Self")}
+                                        </Badge>
+                                        <span className="text-xs text-gray-600 dark:text-gray-300">
+                                          {`${main.firstName || ""} ${main.lastName || ""}`.trim() || "—"}
+                                        </span>
+                                      </div>
+                                    ) : null}
+                                    {children.map((p: any) => (
+                                      <div key={p.id} className="flex items-center gap-2 pl-4">
+                                        <span className="text-xs text-gray-400 dark:text-gray-500">↳</span>
+                                        <Badge
+                                          variant="secondary"
+                                          className="text-[10px] px-2 py-0.5"
+                                          title={`${p.firstName || ""} ${p.lastName || ""}`.trim()}
+                                        >
+                                          {String(p.relation || "Other")}
+                                        </Badge>
+                                        <span className="text-xs text-gray-600 dark:text-gray-300">
+                                          {`${p.firstName || ""} ${p.lastName || ""}`.trim() || "—"}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-gray-700 dark:text-gray-300">
                           {user.department?.trim() || "-"}
@@ -5493,7 +5673,7 @@ export default function UserManagement() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center justify-end gap-2">
-                            {user.role === "patient" && canManageRoles && (
+                            {user.role === "patient" && canManageRoles && canShowAddFamilyMemberForUser(user) && (
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -5566,7 +5746,7 @@ export default function UserManagement() {
                           <div>
                             <div className="flex items-center gap-2 min-w-0">
                               <h3 className="font-medium text-gray-900 dark:text-gray-100 truncate">
-                                {user.firstName || 'N/A'} {user.lastName || 'N/A'}
+                                {displayNameForUserRow(user)}
                               </h3>
                               {user.role === "patient" && (
                                 <Badge variant={user.isActive ? "default" : "secondary"}>
@@ -5623,7 +5803,7 @@ export default function UserManagement() {
                       )}
                       
                       <div className="flex items-center justify-end space-x-2 pt-3 border-t">
-                        {user.role === "patient" && canManageRoles && (
+                        {user.role === "patient" && canManageRoles && canShowAddFamilyMemberForUser(user) && (
                           <Button
                             variant="outline"
                             size="sm"
@@ -5799,8 +5979,25 @@ export default function UserManagement() {
                         id="familyDob"
                         type="date"
                         value={familyMemberForm.watch("dateOfBirth") || ""}
+                        min={(() => {
+                          const today = new Date();
+                          today.setHours(0, 0, 0, 0);
+                          const minDate = new Date(today);
+                          minDate.setFullYear(minDate.getFullYear() - 18);
+                          // Under 18 -> strictly after cutoff, so set min to cutoff + 1 day.
+                          minDate.setDate(minDate.getDate() + 1);
+                          return minDate.toISOString().slice(0, 10);
+                        })()}
+                        max={(() => {
+                          const today = new Date();
+                          today.setHours(0, 0, 0, 0);
+                          return today.toISOString().slice(0, 10);
+                        })()}
                         onChange={(e) => familyMemberForm.setValue("dateOfBirth", e.target.value, { shouldValidate: true })}
                       />
+                      {familyMemberForm.formState.errors.dateOfBirth && (
+                        <p className="text-sm text-red-500">{String(familyMemberForm.formState.errors.dateOfBirth.message || "")}</p>
+                      )}
                     </div>
 
                     <div className="space-y-2">
@@ -5822,19 +6019,9 @@ export default function UserManagement() {
 
                     <div className="space-y-2 md:col-span-2">
                       <Label>Relation</Label>
-                      <Select
-                        value={familyMemberForm.watch("relation")}
-                        onValueChange={(v) => familyMemberForm.setValue("relation", v as any, { shouldValidate: true })}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select relation" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {relationOptions.map((rel) => (
-                            <SelectItem key={rel} value={rel}>{rel}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      <div className="h-10 px-3 flex items-center rounded-md border bg-gray-50 dark:bg-gray-900 text-sm text-gray-900 dark:text-gray-100">
+                        Dependent Child
+                      </div>
                       {familyMemberForm.formState.errors.relation && (
                         <p className="text-sm text-red-500">{familyMemberForm.formState.errors.relation.message}</p>
                       )}
@@ -5852,7 +6039,7 @@ export default function UserManagement() {
                             fullName: "",
                             dateOfBirth: "",
                             genderAtBirth: "",
-                            relation: "Other",
+                            relation: "Dependent Child",
                           });
                         }}
                       >

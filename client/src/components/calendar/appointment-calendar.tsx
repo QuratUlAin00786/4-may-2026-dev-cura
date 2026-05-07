@@ -4669,26 +4669,32 @@ Medical License: [License Number]
                             </Command>
                           </PopoverContent>
                         </Popover>
-                        {selectedRole && selectedProviderId && (
-                          <button
-                            type="button"
-                            onClick={() => openAddTreatmentsPopup()}
-                            className="mt-2 text-sm text-blue-600 hover:text-blue-700 underline"
-                            data-testid="link-add-treatments"
-                          >
-                            Add new treatments for this role and name
-                          </button>
-                        )}
-                        {appointmentSelectedTreatment && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="mt-1 px-0 text-blue-600"
-                            onClick={() => setAppointmentSelectedTreatment(null)}
-                          >
-                            Clear selection
-                          </Button>
-                        )}
+                        {(selectedRole && selectedProviderId) || appointmentSelectedTreatment ? (
+                          <div className="mt-2 flex items-center justify-between gap-2">
+                            {selectedRole && selectedProviderId ? (
+                              <button
+                                type="button"
+                                onClick={() => openAddTreatmentsPopup()}
+                                className="text-sm text-blue-600 hover:text-blue-700 underline"
+                                data-testid="link-add-treatments"
+                              >
+                                Add new treatments for this role and name
+                              </button>
+                            ) : (
+                              <span />
+                            )}
+                            {appointmentSelectedTreatment ? (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="px-0 text-blue-600"
+                                onClick={() => setAppointmentSelectedTreatment(null)}
+                              >
+                                Clear selection
+                              </Button>
+                            ) : null}
+                          </div>
+                        ) : null}
                         {treatmentSelectionError && (
                           <p className="text-red-500 text-xs mt-1">{treatmentSelectionError}</p>
                         )}
@@ -5403,6 +5409,23 @@ Medical License: [License Number]
                       return;
                     }
 
+                    // Must select appointment type and corresponding option BEFORE opening summary
+                    setAppointmentTypeError("");
+                    setTreatmentSelectionError("");
+                    setConsultationSelectionError("");
+                    if (!appointmentType) {
+                      setAppointmentTypeError("Please select an appointment type.");
+                      return;
+                    }
+                    if (appointmentType === "treatment" && !appointmentSelectedTreatment) {
+                      setTreatmentSelectionError("Please select a treatment.");
+                      return;
+                    }
+                    if (appointmentType === "consultation" && !appointmentSelectedConsultation) {
+                      setConsultationSelectionError("Please select a consultation.");
+                      return;
+                    }
+
                     await refetch();
 
                     // Same patient cannot overlap scheduled/confirmed windows with any provider
@@ -5629,7 +5652,14 @@ Medical License: [License Number]
               onClick={handleBulkTreatmentSave}
               disabled={isSavingTreatment || (treatmentsInfoList || []).length === 0}
             >
-              {isSavingTreatment ? "Adding..." : "Add Selected Treatments"}
+              {isSavingTreatment ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Adding...
+                </span>
+              ) : (
+                "Add Selected Treatments"
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>

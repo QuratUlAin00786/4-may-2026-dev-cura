@@ -50,6 +50,13 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/use-auth";
 import { useToast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
+import {
+  getAppointmentCardTimeKind,
+  appointmentOngoingBadgePositionClassName,
+  appointmentCardTimeBackgroundClass,
+  useAppointmentTimeTick,
+} from "@/lib/appointment-card-time-style";
 
 const statusColors = {
   scheduled: "#4A7DFF",
@@ -88,6 +95,8 @@ export default function PatientAppointments({
   const [providerFilter, setProviderFilter] = useState<string>("");
   const [dateTimeFilter, setDateTimeFilter] = useState<string>("");
   const [showAdvancedFilters, setShowAdvancedFilters] = useState<boolean>(false);
+  /** Patient-only: filter list by profile relation (Self, Son, …). Empty = all. */
+  const [relationFilter, setRelationFilter] = useState<string>("");
   
   // Success modal state
   const [showSuccessModal, setShowSuccessModal] = useState(false);
@@ -100,6 +109,13 @@ export default function PatientAppointments({
   const { user } = useAuth();
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const appointmentTimeTick = useAppointmentTimeTick();
+  const nowForCardStyle = React.useMemo(() => new Date(), [appointmentTimeTick]);
+
+  /** Lighter green than calendar default for "Ongoing" badge on patient list. */
+  const patientOngoingBadgeClassName =
+    "bg-emerald-50 text-emerald-800 border border-emerald-100/90 dark:bg-emerald-950/30 dark:text-emerald-100 dark:border-emerald-800/45 " +
+    "text-[10px] font-semibold uppercase tracking-wide shadow-sm";
 
   // Helper function to normalize status values for case-insensitive filtering
   const normalizeStatus = (s?: string) => (s || '').toLowerCase().replace(/\s+/g, '_');
@@ -279,55 +295,85 @@ export default function PatientAppointments({
     usersLoading ||
     rolesLoading;
 
-  // Find the patient record for the logged-in user
-  const currentPatient = React.useMemo(() => {
-    if (
-      !user ||
-      user.role !== "patient" ||
-      !patientsData ||
-      !Array.isArray(patientsData)
-    ) {
-      console.log("🔍 PATIENT-APPOINTMENTS: Patient lookup failed", {
-        hasUser: !!user,
-        userRole: user?.role,
-        hasPatientsData: !!patientsData,
-        patientsDataType: Array.isArray(patientsData)
-          ? "array"
-          : typeof patientsData,
-      });
-      return null;
-    }
+  const normalizeEmail = (e?: string | null) => String(e ?? "").trim().toLowerCase();
 
-    console.log("🔍 PATIENT-APPOINTMENTS: Looking for patient matching user:", {
-      userEmail: user.email,
-      userName: `${user.firstName} ${user.lastName}`,
-      userId: user.id,
-    });
-    console.log(
-      "📋 PATIENT-APPOINTMENTS: Available patients:",
-      patientsData.map((p) => ({
-        id: p.id,
-        email: p.email,
-        name: `${p.firstName} ${p.lastName}`,
-      })),
-    );
-
-    // Match by userId field (primary method)
-    const foundPatient = patientsData.find(
-      (patient: any) => patient.userId === user.id
-    );
-
-    if (foundPatient) {
-      console.log(
-        "✅ PATIENT-APPOINTMENTS: Found matching patient:",
-        foundPatient,
-      );
-    } else {
-      console.log("❌ PATIENT-APPOINTMENTS: No matching patient found");
-    }
-
-    return foundPatient;
+  /** Patient rows for this login (same `userId` as auth user). */
+  const patientsForLoggedInUser = React.useMemo(() => {
+    if (!user || user.role !== "patient" || !patientsData || !Array.isArray(patientsData)) return [];
+    return patientsData.filter((p: any) => Number(p.userId) === Number(user.id));
   }, [user, patientsData]);
+
+  /**
+   * True when at least one patient row is explicitly linked to this user account
+   * with the same email as `users.email` (typical "Self" / account holder).
+   * Then we include appointments for every patient profile sharing that `userId` (family).
+   */
+  const patientAccountLinkedByEmail = React.useMemo(() => {
+    if (!user?.email || patientsForLoggedInUser.length === 0) return false;
+    const u = normalizeEmail(user.email);
+    return patientsForLoggedInUser.some((p: any) => normalizeEmail(p.email) === u);
+  }, [user?.email, patientsForLoggedInUser]);
+
+  // Primary patient row for this login: prefer "Self", else first profile with same userId
+  const currentPatient = React.useMemo(() => {
+    if (patientsForLoggedInUser.length === 0) return null;
+    const self = patientsForLoggedInUser.find(
+      (p: any) => String(p.relation ?? "").trim().toLowerCase() === "self",
+    );
+    return self ?? patientsForLoggedInUser[0];
+  }, [patientsForLoggedInUser]);
+
+  /** All `patients.id` values whose appointments this user may see. */
+  const linkedPatientIds = React.useMemo(() => {
+    if (!user || user.role !== "patient") return new Set<number>();
+    if (patientAccountLinkedByEmail) {
+      return new Set(patientsForLoggedInUser.map((p: any) => Number(p.id)));
+    }
+    if (currentPatient?.id != null) return new Set([Number(currentPatient.id)]);
+    return new Set<number>();
+  }, [user, patientAccountLinkedByEmail, patientsForLoggedInUser, currentPatient]);
+
+  const patientByIdMap = React.useMemo(() => {
+    const m = new Map<number, any>();
+    if (!patientsData || !Array.isArray(patientsData)) return m;
+    for (const p of patientsData) {
+      if (p?.id != null) m.set(Number(p.id), p);
+    }
+    return m;
+  }, [patientsData]);
+
+  const formatRelationBadge = (relation?: string | null) => {
+    const r = String(relation ?? "").trim();
+    if (!r) return "";
+    return r.charAt(0).toUpperCase() + r.slice(1).toLowerCase();
+  };
+
+  /** Distinct relations for profiles linked to this patient login (for filter dropdown). */
+  const relationFilterOptions = React.useMemo(() => {
+    if (!user || user.role !== "patient" || linkedPatientIds.size === 0) return [];
+    const seen = new Set<string>();
+    const labels: string[] = [];
+    for (const id of linkedPatientIds) {
+      const p = patientByIdMap.get(id);
+      const raw = String(p?.relation ?? "").trim();
+      if (!raw) continue;
+      const key = raw.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      labels.push(raw);
+    }
+    const rank = (rel: string) => {
+      const x = rel.toLowerCase();
+      if (x === "self") return 0;
+      if (x === "spouse") return 1;
+      return 50;
+    };
+    return labels.sort((a, b) => {
+      const d = rank(a) - rank(b);
+      if (d !== 0) return d;
+      return a.localeCompare(b, undefined, { sensitivity: "base" });
+    });
+  }, [user, linkedPatientIds, patientByIdMap]);
 
   // Filter appointments to show all appointments created by any role
   // filtered by patient_id and organization_id (matching subdomain)
@@ -338,15 +384,15 @@ export default function PatientAppointments({
     // Show all appointments from all roles (no role-based filtering)
     let filtered = appointmentsData;
     
-    // For patient role users, filter by matching patientId with currentPatient.id
-    if (user?.role === 'patient' && currentPatient) {
-      filtered = filtered.filter((apt: any) => apt.patientId === currentPatient.id);
+    // For patient role: one profile, or whole family when userId + email match users row
+    if (user?.role === "patient" && linkedPatientIds.size > 0) {
+      filtered = filtered.filter((apt: any) => linkedPatientIds.has(Number(apt.patientId)));
     }
     
     // Appointments are already filtered by organizationId at the backend level via tenant middleware
     // This ensures only appointments from the active user's organization (matching subdomain) are shown
     return filtered;
-  }, [appointmentsData, user?.role, currentPatient]);
+  }, [appointmentsData, user?.role, linkedPatientIds]);
 
   const getDoctorSpecialtyData = (providerId: number) => {
     const doctorsResponse = doctorsData as any;
@@ -1579,7 +1625,7 @@ export default function PatientAppointments({
   const getPatientFilteredAppointments = React.useMemo(() => {
     if (user?.role !== "patient") return appointments;
 
-    // Start with the already patient-filtered appointments (appointments already filtered by currentPatient.id)
+    // Start with appointments already filtered by linked patient id(s) for this login
     let filtered = appointments;
 
     // Filter by provider (based on role selection)
@@ -1598,13 +1644,64 @@ export default function PatientAppointments({
       });
     }
 
+    if (relationFilter) {
+      const want = relationFilter.toLowerCase();
+      filtered = filtered.filter((apt: any) => {
+        const p = patientByIdMap.get(Number(apt.patientId));
+        return String(p?.relation ?? "").trim().toLowerCase() === want;
+      });
+    }
+
     return filtered;
   }, [
     appointments,
     providerFilter,
     dateTimeFilter,
+    relationFilter,
+    patientByIdMap,
     user?.role,
   ]);
+
+  /** "Next" for today only — same rules as appointment calendar (after any ongoing block). */
+  const nextUpcomingAppointmentId = React.useMemo(() => {
+    const list = getPatientFilteredAppointments.filter((apt: any) =>
+      isToday(parseScheduledAtAsLocal(apt.scheduledAt)),
+    );
+    if (!list.length) return null;
+    const toStartEnd = (apt: any) => {
+      const start = apt?.scheduledAt ? parseScheduledAtAsLocal(apt.scheduledAt) : new Date(NaN);
+      const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+      const end = new Date(start.getTime() + dur * 60 * 1000);
+      return { start, end };
+    };
+    const isActiveForOngoing = (apt: any) => {
+      const st = String(apt?.status ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, "_");
+      return st === "scheduled" || st === "confirmed" || st === "in_progress";
+    };
+    const sorted = [...list].sort(
+      (a, b) =>
+        parseScheduledAtAsLocal(a.scheduledAt).getTime() - parseScheduledAtAsLocal(b.scheduledAt).getTime(),
+    );
+    const ongoing = sorted
+      .map((apt: any) => ({ apt, ...toStartEnd(apt) }))
+      .filter(({ apt }) => isActiveForOngoing(apt))
+      .filter(({ start, end }) => !Number.isNaN(start.getTime()) && start <= nowForCardStyle && end > nowForCardStyle);
+    const all = sorted
+      .map((apt: any) => ({ apt, ...toStartEnd(apt) }))
+      .filter(({ apt }) => isActiveForOngoing(apt))
+      .filter(({ start }) => !Number.isNaN(start.getTime()))
+      .sort((a, b) => a.start.getTime() - b.start.getTime());
+    if (ongoing.length > 0) {
+      const maxOngoingEnd = ongoing.reduce((acc, cur) => (cur.end > acc ? cur.end : acc), ongoing[0].end);
+      const afterOngoing = all.filter(({ start }) => start >= maxOngoingEnd);
+      if (afterOngoing.length > 0) return Number(afterOngoing[0].apt.id);
+    }
+    const upcoming = all.filter(({ start }) => start > nowForCardStyle);
+    return upcoming.length > 0 ? Number(upcoming[0].apt.id) : null;
+  }, [getPatientFilteredAppointments, nowForCardStyle]);
 
   // Filter and sort appointments by date for the logged-in patient
   const base = user?.role === "patient" ? getPatientFilteredAppointments : appointments;
@@ -1775,7 +1872,30 @@ export default function PatientAppointments({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {user?.role === "patient" && relationFilterOptions.length > 0 && (
+            <div className="flex items-center gap-2">
+              <Label htmlFor="relation-filter" className="text-sm text-muted-foreground whitespace-nowrap sr-only sm:not-sr-only sm:inline">
+                Relation
+              </Label>
+              <Select
+                value={relationFilter || "__all__"}
+                onValueChange={(v) => setRelationFilter(v === "__all__" ? "" : v)}
+              >
+                <SelectTrigger id="relation-filter" className="h-9 w-[min(100vw-8rem,11rem)]" data-testid="select-relation-filter">
+                  <SelectValue placeholder="All relations" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">All relations</SelectItem>
+                  {relationFilterOptions.map((r) => (
+                    <SelectItem key={r} value={r.toLowerCase()}>
+                      {formatRelationBadge(r)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {user?.role === "patient" && (
             <Button
               variant="outline"
@@ -1802,9 +1922,21 @@ export default function PatientAppointments({
       {nextAppointment && (
         <Card className="border-blue-200 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/20">
           <CardHeader className="pb-3">
-            <CardTitle className="text-lg text-blue-800 dark:text-blue-300">
-              Next Appointment
-            </CardTitle>
+            <div className="flex flex-wrap items-center gap-2">
+              <CardTitle className="text-lg text-blue-800 dark:text-blue-300">
+                Next Appointment
+              </CardTitle>
+              {user?.role === "patient" &&
+                (() => {
+                  const np = patientByIdMap.get(Number(nextAppointment.patientId));
+                  const rl = formatRelationBadge(np?.relation);
+                  return rl ? (
+                    <Badge variant="secondary" className="text-xs font-medium">
+                      {rl}
+                    </Badge>
+                  ) : null;
+                })()}
+            </div>
           </CardHeader>
           <CardContent>
             <div className="flex items-center justify-between">
@@ -1987,6 +2119,7 @@ export default function PatientAppointments({
                       setRoleFilter("");
                       setProviderFilter("");
                       setDateTimeFilter("");
+                      setRelationFilter("");
                     }}
                     data-testid="button-clear-filters"
                   >
@@ -2020,23 +2153,79 @@ export default function PatientAppointments({
           </Card>
         ) : (
           filteredAppointments.map((appointment: any) => {
-            const appointmentDate = new Date(appointment.scheduledAt);
-            const isUpcoming =
-              isFuture(appointmentDate) || isToday(appointmentDate);
+            const cardTimeKind = getAppointmentCardTimeKind(
+              appointment,
+              nowForCardStyle,
+              parseScheduledAtAsLocal,
+            );
             const serviceInfo = getAppointmentServiceInfo(appointment);
+            const aptPatient =
+              user?.role === "patient"
+                ? patientByIdMap.get(Number(appointment.patientId))
+                : null;
+            const relationLabel = formatRelationBadge(aptPatient?.relation);
 
             return (
               <Card
                 key={appointment.id}
-                className={`border-l-4 ${isUpcoming ? "bg-white dark:bg-gray-800" : "bg-gray-50 dark:bg-gray-800/50"}`}
-                style={{
-                  borderLeftColor:
-                    statusColors[
-                      appointment.status as keyof typeof statusColors
-                    ],
-                }}
+                className={cn(
+                  "relative overflow-visible border rounded-lg pt-8",
+                  appointmentCardTimeBackgroundClass(cardTimeKind),
+                  "ring-inset hover:ring-1 hover:ring-gray-200 dark:hover:ring-gray-600",
+                )}
                 data-testid={`appointment-${appointment.id}`}
               >
+                {(() => {
+                  const st = String(appointment?.status ?? "")
+                    .toLowerCase()
+                    .trim()
+                    .replace(/\s+/g, "_");
+                  const allowOngoing =
+                    st === "scheduled" || st === "confirmed" || st === "in_progress";
+                  return allowOngoing && cardTimeKind === "ongoing";
+                })() && (
+                  <Badge
+                    className={cn(
+                      patientOngoingBadgeClassName,
+                      appointmentOngoingBadgePositionClassName,
+                    )}
+                  >
+                    Ongoing
+                  </Badge>
+                )}
+                {(() => {
+                  if (cardTimeKind !== "past") return false;
+                  const st = String(appointment?.status ?? "")
+                    .toLowerCase()
+                    .trim()
+                    .replace(/\s+/g, "_");
+                  return (
+                    st !== "cancelled" &&
+                    st !== "canceled" &&
+                    st !== "rescheduled" &&
+                    st !== "no_show"
+                  );
+                })() && (
+                  <Badge
+                    className={cn(
+                      appointmentOngoingBadgePositionClassName,
+                      "bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600 text-xs",
+                    )}
+                  >
+                    Passed
+                  </Badge>
+                )}
+                {nextUpcomingAppointmentId != null &&
+                  Number(appointment.id) === Number(nextUpcomingAppointmentId) && (
+                    <Badge
+                      className={cn(
+                        appointmentOngoingBadgePositionClassName,
+                        "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 text-xs",
+                      )}
+                    >
+                      Next
+                    </Badge>
+                  )}
                 <CardContent className="p-6">
                   {user?.role === 'patient' && appointment.appointmentId && (
                     <div className="mb-3">
@@ -2051,9 +2240,20 @@ export default function PatientAppointments({
               <div className="flex items-center justify-between">
                     <div className="space-y-3 flex-1">
                       <div className="flex items-center justify-between">
-                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                          {formatAppointmentTitle(appointment)}
-                        </h3>
+                        <div className="flex flex-wrap items-center gap-2 min-w-0">
+                          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                            {formatAppointmentTitle(appointment)}
+                          </h3>
+                          {user?.role === "patient" && relationLabel && (
+                            <Badge
+                              variant="secondary"
+                              className="text-xs font-medium shrink-0"
+                              data-testid={`badge-relation-${appointment.id}`}
+                            >
+                              {relationLabel}
+                            </Badge>
+                          )}
+                        </div>
                         <div className="flex items-center space-x-2">
                           {normalizeStatus(appointment.status) !== "cancelled" && (
                             <Button
@@ -2122,19 +2322,13 @@ export default function PatientAppointments({
                         <div className="flex items-center space-x-2">
                           <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
                           <span className="text-sm text-gray-700 dark:text-gray-300">
-                            {currentPatient
-                              ? `${currentPatient.firstName} ${currentPatient.lastName}`
-                              : "Patient"}
+                            {aptPatient
+                              ? `${aptPatient.firstName ?? ""} ${aptPatient.lastName ?? ""}`.trim() || "Patient"
+                              : currentPatient
+                                ? `${currentPatient.firstName} ${currentPatient.lastName}`
+                                : "Patient"}
                           </span>
                         </div>
-                        {user?.role === "patient" && currentPatient?.relation && (
-                          <div className="flex items-center space-x-2">
-                            <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                            <span className="text-sm text-gray-700 dark:text-gray-300">
-                              Relation: {currentPatient.relation}
-                            </span>
-                          </div>
-                        )}
                         {getDoctorSpecialtyData(appointment.providerId)
                           .name && (
                           <div className="flex items-center space-x-2">

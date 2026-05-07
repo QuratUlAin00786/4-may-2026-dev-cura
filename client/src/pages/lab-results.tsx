@@ -817,6 +817,51 @@ export default function LabResultsPage() {
     }
   };
 
+  /**
+   * Auto-send lab result PDF after generation to:
+   * - patient email (resolved from patients table)
+   * - provider email (orderedBy user email)
+   */
+  const autoSendLabResultEmails = async (labResult: any) => {
+    if (!labResult) return;
+    try {
+      // Resolve custom patient_id (patients.patient_id) from the currently loaded patients list.
+      const patientRow = Array.isArray(patients)
+        ? (patients as any[]).find((p) => Number(p?.id) === Number(labResult.patientId))
+        : null;
+      const customPatientId = String(patientRow?.patientId ?? "").trim();
+      if (!customPatientId) return;
+
+      // Fetch patient email from DB by patient_id.
+      const emailRes = await apiRequest(
+        "GET",
+        `/api/patients/email-by-patient-id?${new URLSearchParams({ patientId: customPatientId }).toString()}`,
+      );
+      const emailData = await emailRes.json();
+      const patientEmail = String(emailData?.email ?? "").trim();
+
+      // Provider email from users table (orderedBy).
+      const orderedById = Number(labResult.orderedBy);
+      const orderedByUser = Array.isArray(users) ? (users as any[]).find((u) => Number(u?.id) === orderedById) : null;
+      const providerEmail = String(orderedByUser?.email ?? "").trim();
+
+      const recipients = Array.from(new Set([patientEmail, providerEmail].map((x) => String(x || "").trim()).filter(Boolean)));
+      if (recipients.length === 0) return;
+
+      await Promise.all(
+        recipients.map((recipientEmail) =>
+          apiRequest("POST", `/api/lab-results/${labResult.id}/share-email`, {
+            recipientEmail,
+            message: `Lab results for ${labResult.testType || "your test"} are now available.`,
+          }),
+        ),
+      );
+    } catch (e) {
+      // Do not block generation success on email failures.
+      console.warn("[LAB-AUTO-SHARE] Auto email failed:", e);
+    }
+  };
+
   // E-Signature states
   const [showESignDialog, setShowESignDialog] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
@@ -8712,6 +8757,9 @@ Report generated from Cura EMR System`;
 
                         // Do not open the separate "Lab Result Generated" popup anymore.
                         setAutoSharePreviewResult(selectedLabOrder);
+
+                        // Auto-send the generated PDF to patient + provider (orderedBy) via email.
+                        void autoSendLabResultEmails(selectedLabOrder);
 
                         // Open generated PDF in popup (do NOT download or open new tab)
                         try {

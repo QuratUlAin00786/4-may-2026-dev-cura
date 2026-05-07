@@ -33,6 +33,7 @@ export default function PublicBookAppointmentPage() {
   const [loading, setLoading] = useState(true);
   const [doctors, setDoctors] = useState<Array<{ id: number; name: string; role?: string }>>([]);
   const [prefill, setPrefill] = useState<{ email?: string; doctorId?: number } | null>(null);
+  const emailLockedByToken = useMemo(() => !!(tokenParam && prefill?.email), [tokenParam, prefill]);
 
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -75,6 +76,7 @@ export default function PublicBookAppointmentPage() {
   const [redirectToLoginAfterEdit, setRedirectToLoginAfterEdit] = useState(false);
   const [showRescheduleEmailSentDialog, setShowRescheduleEmailSentDialog] = useState(false);
   const [rescheduleEmailRecipients, setRescheduleEmailRecipients] = useState<string[]>([]);
+  const [rescheduleEmailRecipientNames, setRescheduleEmailRecipientNames] = useState<string[]>([]);
 
   const getNext15Minutes = (hhmm: string): string => {
     const [hhStr, mmStr] = hhmm.split(":");
@@ -99,6 +101,7 @@ export default function PublicBookAppointmentPage() {
   const [showSuccessDialog, setShowSuccessDialog] = useState(false);
   const [showAlreadyBookedDialog, setShowAlreadyBookedDialog] = useState(false);
   const [alreadyBookedDetails, setAlreadyBookedDetails] = useState<any>(null);
+  const [rescheduleTargetAppointmentId, setRescheduleTargetAppointmentId] = useState<string | null>(null);
   const [bookedAppointment, setBookedAppointment] = useState<{
     appointmentId: string;
     doctorName: string;
@@ -518,6 +521,13 @@ export default function PublicBookAppointmentPage() {
     }
     setSubmitting(true);
     try {
+      // If the booking link has already been used, allow the user to reschedule the
+      // originally booked appointment by creating a new one and marking the old as rescheduled.
+      if (rescheduleTargetAppointmentId) {
+        await handleReplaceExistingAppointment(rescheduleTargetAppointmentId);
+        return;
+      }
+
       const data = await createPublicAppointment();
       const selectedDoctor = doctors.find((d) => String(d.id) === doctorId)?.name || "Selected doctor";
       const selectedService = serviceOptions.find((s) => String(s.id) === serviceId)?.name || "Selected service";
@@ -564,14 +574,23 @@ export default function PublicBookAppointmentPage() {
         try {
           const details = (e?.message || "").includes("{") ? JSON.parse(String(e.message).split(":").slice(1).join(":").trim()) : null;
           if (details?.bookedDetails) {
-            setAlreadyBookedDetails(normalizeBookedDetails(details.bookedDetails) || details.bookedDetails);
+            const normalized = normalizeBookedDetails(details.bookedDetails) || details.bookedDetails;
+            setAlreadyBookedDetails(normalized);
             setShowAlreadyBookedDialog(true);
+            // Persist so reopening the link can show the popup too.
+            try {
+              const key = `publicBooking:alreadyUsed:${subdomain || ""}:${tokenParam || ""}`;
+              sessionStorage.setItem(key, JSON.stringify(normalized));
+            } catch {}
           } else {
             setShowAlreadyBookedDialog(true);
           }
         } catch {
           setShowAlreadyBookedDialog(true);
         }
+        // As requested: instead of showing a booking error, redirect to login.
+        window.location.href = "/auth/login";
+        return;
       }
       toast({ title: "Booking failed", description: e?.message || "Unable to book appointment", variant: "destructive" });
     } finally {
@@ -579,14 +598,39 @@ export default function PublicBookAppointmentPage() {
     }
   };
 
-  const handleReplaceExistingAppointment = async () => {
+  const extractAppointmentId = (input: any): string | null => {
+    if (!input) return null;
+    if (typeof input === "string" || typeof input === "number") {
+      const s = String(input).trim();
+      return s ? s : null;
+    }
+    if (typeof input === "object") {
+      const candidate =
+        (input as any)?.appointment_id ??
+        (input as any)?.appointmentId ??
+        (input as any)?.id ??
+        null;
+      if (candidate == null) return null;
+      const s = String(candidate).trim();
+      return s ? s : null;
+    }
+    return null;
+  };
+
+  const handleReplaceExistingAppointment = async (appointmentIdOverride?: any) => {
     // Instead of updating the existing appointment (PATCHing date/time), we mark it as rescheduled
     // and create a brand-new appointment with the currently selected service + slot.
     if (!subdomain) {
       toast({ title: "Missing subdomain", description: "Invalid booking URL", variant: "destructive" });
       return;
     }
-    const apptId = duplicationData?.existingAppointment?.appointment_id;
+    const apptId =
+      extractAppointmentId(appointmentIdOverride) ||
+      extractAppointmentId(duplicationData?.existingAppointment) ||
+      extractAppointmentId(duplicationData?.existingAppointment?.appointment_id) ||
+      extractAppointmentId(alreadyBookedDetails?.appointmentId) ||
+      extractAppointmentId(alreadyBookedDetails?.appointment_id) ||
+      null;
     if (!apptId) {
       toast({ title: "Missing appointment", description: "No existing appointment to reschedule.", variant: "destructive" });
       return;
@@ -601,7 +645,7 @@ export default function PublicBookAppointmentPage() {
       // so we must reschedule the existing record before creating the new one.
       const rescheduleRes1 = await apiRequest(
         "PATCH",
-        `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(String(apptId))}`,
+        `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(apptId)}`,
         {
           email: email.trim() || null,
           phone: phone.trim() || null,
@@ -623,7 +667,7 @@ export default function PublicBookAppointmentPage() {
       if (createdAppointmentId) {
         const rescheduleRes2 = await apiRequest(
           "PATCH",
-          `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(String(apptId))}`,
+          `/api/public/${encodeURIComponent(subdomain)}/appointments/${encodeURIComponent(apptId)}`,
           {
             email: email.trim() || null,
             phone: phone.trim() || null,
@@ -656,6 +700,13 @@ export default function PublicBookAppointmentPage() {
             });
           } else {
             setRescheduleEmailRecipients(attempted);
+            // Display names (not email addresses) in the UI.
+            const selectedDoctor = doctors.find((d) => String(d.id) === doctorId)?.name || "Selected doctor";
+            const names: string[] = [];
+            const patientName = name.trim();
+            if (patientName) names.push(patientName);
+            if (selectedDoctor) names.push(selectedDoctor);
+            setRescheduleEmailRecipientNames(names);
             setShowRescheduleEmailSentDialog(true);
           }
         }
@@ -674,6 +725,8 @@ export default function PublicBookAppointmentPage() {
       });
       setShowDuplicationDialog(false);
       setShowSummaryDialog(false);
+      setShowAlreadyBookedDialog(false);
+      setRescheduleTargetAppointmentId(null);
       const checkoutUrl = String(data?.checkoutUrl || "").trim();
       if (checkoutUrl) {
         window.location.href = checkoutUrl;
@@ -731,12 +784,18 @@ export default function PublicBookAppointmentPage() {
                 </div>
                   <div>
                     <label className="block text-sm font-medium mb-1">Email</label>
-                    <Input
-                      type="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      placeholder="name@example.com"
-                    />
+                    {emailLockedByToken ? (
+                      <div className="h-10 px-3 flex items-center rounded-md border bg-muted/40 text-sm text-foreground">
+                        {email || "-"}
+                      </div>
+                    ) : (
+                      <Input
+                        type="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="name@example.com"
+                      />
+                    )}
                     <p className="text-xs text-muted-foreground mt-1">
                       Appointment confirmation will be sent on this email
                     </p>
@@ -1091,9 +1150,9 @@ export default function PublicBookAppointmentPage() {
           <div className="text-sm space-y-2">
             <div className="rounded-md border p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Recipients</div>
-              {rescheduleEmailRecipients.length > 0 ? (
+              {rescheduleEmailRecipientNames.length > 0 ? (
                 <ul className="list-disc pl-5 space-y-1">
-                  {rescheduleEmailRecipients.map((r) => (
+                  {rescheduleEmailRecipientNames.map((r) => (
                     <li key={r}>{r}</li>
                   ))}
                 </ul>
@@ -1107,6 +1166,8 @@ export default function PublicBookAppointmentPage() {
               onClick={() => {
                 setShowRescheduleEmailSentDialog(false);
                 setRescheduleEmailRecipients([]);
+                setRescheduleEmailRecipientNames([]);
+                window.location.href = "/auth/login";
               }}
             >
               OK
@@ -1624,7 +1685,7 @@ export default function PublicBookAppointmentPage() {
           <DialogHeader>
             <DialogTitle>You have already booked an appointment</DialogTitle>
             <DialogDescription>
-              This booking link can only be used once.
+              This booking link was already used. You can still reschedule the existing appointment using this page.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-1 text-sm">
@@ -1637,6 +1698,24 @@ export default function PublicBookAppointmentPage() {
             <p><span className="font-medium">Duration:</span> {(alreadyBookedDetails?.duration != null) ? `${alreadyBookedDetails.duration} minutes` : "-"}</p>
       </div>
           <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                const id = String(alreadyBookedDetails?.appointmentId || alreadyBookedDetails?.appointment_id || "").trim();
+                if (!id) {
+                  toast({ title: "Missing appointment", description: "No existing appointment to reschedule.", variant: "destructive" });
+                  return;
+                }
+                setRescheduleTargetAppointmentId(id);
+                setShowAlreadyBookedDialog(false);
+                toast({
+                  title: "Reschedule mode",
+                  description: "Select a new date/time and click Book Appointment to reschedule.",
+                });
+              }}
+            >
+              Reschedule
+            </Button>
             <Button
               onClick={() => {
                 setShowAlreadyBookedDialog(false);

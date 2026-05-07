@@ -17924,12 +17924,20 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         if (tokenRow.rows.length > 0) {
           const st = String(tokenRow.rows[0].status || "").toLowerCase();
           if (st === "booked") {
+            // Reschedule exception: allow using an already-booked token ONLY to reschedule
+            // the same appointment that was originally booked with this token.
+            const bookedApptId = String(tokenRow.rows[0].appointment_id || "").trim();
+            const rescheduleTarget = String(rescheduleOfAppointmentId || "").trim();
+            if (bookedApptId && rescheduleTarget && bookedApptId === rescheduleTarget) {
+              // Allow: proceed to create the new appointment (caller will mark old one rescheduled).
+            } else {
             return res.status(409).json({
               error: "This booking link has already been used.",
               code: "BOOKING_LINK_ALREADY_USED",
               appointmentId: tokenRow.rows[0].appointment_id ?? null,
               bookedDetails: tokenRow.rows[0].booked_details ?? null,
             });
+            }
           }
         }
       }

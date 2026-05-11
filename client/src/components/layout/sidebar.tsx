@@ -41,7 +41,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useRolePermissions, UserRole } from "@/hooks/use-role-permissions";
 import { isDoctorLike } from "@/lib/role-utils";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
-import { Avatar, AvatarContent, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarContent, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { CurrencyIcon } from "@/components/ui/currency-icon";
@@ -57,6 +57,9 @@ import { LogOut, User, Settings as SettingsIcon } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useTheme } from "@/hooks/use-theme";
 import { useQuery } from "@tanstack/react-query";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest, queryClient, getTenantSubdomain as getTenantSubdomainClient } from "@/lib/queryClient";
+import { Camera } from "lucide-react";
 import type { Organization } from "@/types";
 const darkLogoWhite = new URL("../../../../attached_assets/dark-logo/cura-logo-white.png", import.meta.url).href;
 
@@ -169,10 +172,94 @@ export function Sidebar() {
   const { currencySymbol } = useCurrency();
   const { user, logout, loading: authLoading } = useAuth();
   const { canAccess, getUserRole, isLoading: permissionsLoading } = useRolePermissions();
+  const { toast } = useToast();
   const [isRoleDataReady, setIsRoleDataReady] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const { theme } = useTheme();
+
+  const { data: currentUserDetails } = useQuery<any>({
+    queryKey: ["/api/users/current"],
+    enabled: !!user,
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/users/current");
+      return response.json();
+    },
+    retry: false,
+    staleTime: 30000,
+  });
+
+  const avatarUrl =
+    (currentUserDetails?.profilePicturePath as string | null | undefined) ||
+    ((user as any)?.profilePicturePath as string | null | undefined) ||
+    null;
+
+  const onPickProfileImage = () => {
+    const el = document.getElementById("sidebar-profile-upload") as HTMLInputElement | null;
+    el?.click();
+  };
+
+  const onProfileImageSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] || null;
+    e.target.value = "";
+    if (!file) return;
+
+    const okType =
+      file.type === "image/jpeg" ||
+      file.type === "image/png" ||
+      file.type === "image/webp";
+    if (!okType) {
+      toast({
+        title: "Invalid file type",
+        description: "Only JPG, JPEG, PNG, and WebP images are allowed.",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: "Max file size is 2MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem("auth_token");
+      if (!token) throw new Error("Not authenticated");
+      // Use the same tenant resolution logic as all API calls
+      const subdomain = getTenantSubdomainClient();
+
+      const form = new FormData();
+      form.append("image", file);
+
+      const res = await fetch("/api/users/profile-picture", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "X-Tenant-Subdomain": subdomain,
+        },
+        body: form,
+        credentials: "same-origin",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || `Upload failed (HTTP ${res.status})`);
+      }
+
+      // Refresh avatar everywhere (sidebar + telemedicine user list, etc.)
+      await queryClient.invalidateQueries({ queryKey: ["/api/users/current"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/telemedicine/users"] });
+      toast({ title: "Profile picture updated" });
+    } catch (err: any) {
+      toast({
+        title: "Upload failed",
+        description: err?.message || "Could not upload profile picture.",
+        variant: "destructive",
+      });
+    }
+  };
 
   // Fetch organization data with React Query
   const { data: organizationData } = useQuery<Organization>({
@@ -403,34 +490,65 @@ export function Sidebar() {
             <ThemeToggle />
           </div>
           <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <div className="flex items-center space-x-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-700 rounded-lg p-2 -m-2 transition-colors">
-                <Avatar>
-                  <AvatarContent
-                    className="text-white font-semibold"
-                    style={{ backgroundColor: "var(--primary)" }}
-                  >
-                    {user ? getInitials(user.firstName, user.lastName) : "U"}
-                  </AvatarContent>
-                  <AvatarFallback>
-                    {user ? getInitials(user.firstName, user.lastName) : "U"}
-                  </AvatarFallback>
-                </Avatar>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-gray-900 dark:text-foreground truncate">
-                    {user
-                      ? `${user.firstName} ${user.lastName}`
-                      : "Unknown User"}
-                  </p>
-                  <p className="text-xs text-neutral-600 dark:text-muted-foreground truncate">
-                    {user?.role
-                      ? user.role.charAt(0).toUpperCase() + user.role.slice(1)
-                      : "User"}
-                  </p>
-                </div>
-                <SettingsIcon className="h-4 w-4 text-neutral-600" />
+            <div className="flex items-center space-x-3 rounded-lg p-2 -m-2 transition-colors hover:bg-gray-50 dark:hover:bg-neutral-700">
+              {/* Upload control (avatar click opens file picker) */}
+              <div className="relative">
+                <input
+                  id="sidebar-profile-upload"
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  className="hidden"
+                  onChange={onProfileImageSelected}
+                />
+                <button
+                  type="button"
+                  onClick={(ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    onPickProfileImage();
+                  }}
+                  className="relative"
+                  title="Upload profile picture"
+                  aria-label="Upload profile picture"
+                >
+                  <Avatar>
+                    {avatarUrl ? (
+                      <AvatarImage src={avatarUrl} alt="Profile picture" />
+                    ) : null}
+                    <AvatarContent
+                      className="text-white font-semibold"
+                      style={{ backgroundColor: "var(--primary)" }}
+                    >
+                      {user ? getInitials(user.firstName, user.lastName) : "U"}
+                    </AvatarContent>
+                    <AvatarFallback>
+                      {user ? getInitials(user.firstName, user.lastName) : "U"}
+                    </AvatarFallback>
+                  </Avatar>
+                  <span className="absolute -bottom-1 -right-1 h-6 w-6 rounded-full border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 flex items-center justify-center shadow-sm">
+                    <Camera className="h-3.5 w-3.5 text-neutral-700 dark:text-neutral-200" />
+                  </span>
+                </button>
               </div>
-            </DropdownMenuTrigger>
+
+              {/* Dropdown trigger (name + gear) */}
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="flex items-center space-x-3 flex-1 min-w-0 text-left"
+                >
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-900 dark:text-foreground truncate">
+                      {user ? `${user.firstName} ${user.lastName}` : "Unknown User"}
+                    </p>
+                    <p className="text-xs text-neutral-600 dark:text-muted-foreground truncate">
+                      {user?.role ? user.role.charAt(0).toUpperCase() + user.role.slice(1) : "User"}
+                    </p>
+                  </div>
+                  <SettingsIcon className="h-4 w-4 text-neutral-600 shrink-0" />
+                </button>
+              </DropdownMenuTrigger>
+            </div>
             <DropdownMenuContent align="end" className="w-56">
               <DropdownMenuLabel>
                 <div className="flex flex-col space-y-1">

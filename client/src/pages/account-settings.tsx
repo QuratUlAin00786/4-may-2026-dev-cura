@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
 import { Header } from "@/components/layout/header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,13 +10,19 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
-import { User, Lock, Mail, Shield, Bell, Eye, EyeOff } from "lucide-react";
+import { User, Lock, Mail, Shield, Bell, Eye, EyeOff, Upload, Trash2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 export default function AccountSettings() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+
+  const [profileImageUploading, setProfileImageUploading] = useState(false);
+  const [profileImageDeleting, setProfileImageDeleting] = useState(false);
+  const [isProfileImagePreviewOpen, setIsProfileImagePreviewOpen] = useState(false);
   
   // Profile Update State
   const [profileData, setProfileData] = useState({
@@ -131,6 +137,92 @@ export default function AccountSettings() {
     updateNotificationsMutation.mutate(notifications);
   };
 
+  // Load current user details (includes profilePicturePath) so preview updates immediately after upload/delete.
+  const { data: currentUserDetails } = useQuery<any>({
+    queryKey: ["/api/users/current"],
+    enabled: !!user,
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/users/current");
+      return res.json();
+    },
+    retry: false,
+    staleTime: 30000,
+  });
+  const profilePicturePath: string | null =
+    (currentUserDetails?.profilePicturePath as string | null | undefined) ||
+    ((user as any)?.profilePicturePath as string | null | undefined) ||
+    null;
+
+  const handleUploadProfileImage = async (file: File) => {
+    const okType =
+      file.type === "image/jpeg" ||
+      file.type === "image/png" ||
+      file.type === "image/webp";
+    if (!okType) {
+      toast({
+        title: "Invalid file type",
+        description: "Only JPG, JPEG, PNG, and WebP images are allowed.",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: "Max file size is 2MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setProfileImageUploading(true);
+    try {
+      const token = localStorage.getItem("auth_token");
+      if (!token) throw new Error("Not authenticated");
+
+      const form = new FormData();
+      form.append("image", file);
+      const res = await fetch("/api/users/profile-picture", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+        credentials: "same-origin",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || `Upload failed (HTTP ${res.status})`);
+
+      await queryClient.invalidateQueries({ queryKey: ["/api/users/current"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/telemedicine/users"] });
+      toast({ title: "Profile picture updated" });
+    } catch (e: any) {
+      toast({
+        title: "Upload failed",
+        description: e?.message || "Could not upload profile picture.",
+        variant: "destructive",
+      });
+    } finally {
+      setProfileImageUploading(false);
+    }
+  };
+
+  const handleDeleteProfileImage = async () => {
+    setProfileImageDeleting(true);
+    try {
+      await apiRequest("DELETE", "/api/users/profile-picture");
+      await queryClient.invalidateQueries({ queryKey: ["/api/users/current"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/telemedicine/users"] });
+      toast({ title: "Profile picture removed" });
+    } catch (e: any) {
+      toast({
+        title: "Delete failed",
+        description: e?.message || "Could not remove profile picture.",
+        variant: "destructive",
+      });
+    } finally {
+      setProfileImageDeleting(false);
+    }
+  };
+
   return (
     <div className="w-full min-h-0 flex flex-col page-zoom-90">
       <Header 
@@ -161,6 +253,107 @@ export default function AccountSettings() {
 
             {/* Profile Tab */}
             <TabsContent value="profile" className="space-y-6">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center space-x-2">
+                    <User className="h-5 w-5" />
+                    <span>Profile Picture</span>
+                  </CardTitle>
+                  <CardDescription>Upload, change, or remove your profile photo.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                    <div className="flex items-center gap-4 min-w-0">
+                      <button
+                        type="button"
+                        className="rounded-full"
+                        onClick={() => {
+                          if (profilePicturePath) setIsProfileImagePreviewOpen(true);
+                        }}
+                        disabled={!profilePicturePath}
+                        aria-label="Preview profile picture"
+                      >
+                        <Avatar className="h-16 w-16">
+                          {profilePicturePath ? (
+                            <AvatarImage src={profilePicturePath} alt="Profile picture" />
+                          ) : null}
+                          <AvatarFallback>
+                            {(user?.firstName?.[0] || "U").toUpperCase()}
+                            {(user?.lastName?.[0] || "").toUpperCase()}
+                          </AvatarFallback>
+                        </Avatar>
+                      </button>
+
+                      <div className="min-w-0">
+                        <div className="font-medium truncate">
+                          {user ? `${user.firstName} ${user.lastName}` : "User"}
+                        </div>
+                        <div className="text-sm text-muted-foreground truncate">{user?.email}</div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 sm:ml-auto">
+                      <input
+                        id="account-profile-upload"
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp"
+                        className="hidden"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) handleUploadProfileImage(f);
+                          e.currentTarget.value = "";
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={profileImageUploading}
+                        onClick={() => {
+                          const el = document.getElementById("account-profile-upload") as HTMLInputElement | null;
+                          el?.click();
+                        }}
+                        data-testid="button-uploadProfilePicture"
+                      >
+                        <Upload className="h-4 w-4 mr-2" />
+                        {profileImageUploading ? "Uploading..." : profilePicturePath ? "Change photo" : "Upload photo"}
+                      </Button>
+
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        disabled={profileImageDeleting || !profilePicturePath}
+                        onClick={handleDeleteProfileImage}
+                        data-testid="button-deleteProfilePicture"
+                      >
+                        <Trash2 className="h-4 w-4 mr-2" />
+                        {profileImageDeleting ? "Removing..." : "Remove"}
+                      </Button>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground">
+                    Allowed: JPG/PNG/WebP. Max size: 2MB.
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Dialog open={isProfileImagePreviewOpen} onOpenChange={setIsProfileImagePreviewOpen}>
+                <DialogContent className="sm:max-w-lg">
+                  <DialogHeader>
+                    <DialogTitle>Profile picture</DialogTitle>
+                  </DialogHeader>
+                  <div className="w-full">
+                    {profilePicturePath ? (
+                      <img
+                        src={profilePicturePath}
+                        alt="Profile picture preview"
+                        className="w-full max-h-[70vh] object-contain rounded-md border"
+                      />
+                    ) : null}
+                  </div>
+                </DialogContent>
+              </Dialog>
+
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center space-x-2">

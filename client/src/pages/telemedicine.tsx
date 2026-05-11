@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { queryClient } from "@/lib/queryClient";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
 import { useAuth } from "@/hooks/use-auth";
 import { createRemoteLiveKitRoom } from "@/lib/livekit-room-service";
@@ -14,7 +14,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
@@ -217,16 +217,7 @@ function PatientList({ telemedicineSettings }: { telemedicineSettings?: Telemedi
   const { data: patients, isLoading: patientsLoading } = useQuery({
     queryKey: ["/api/telemedicine/users"],
     queryFn: async () => {
-      const token = localStorage.getItem("auth_token");
-      const response = await fetch("/api/telemedicine/users", {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "X-Tenant-Subdomain": getActiveSubdomain(),
-        },
-      });
-      if (!response.ok) {
-        throw new Error("Failed to fetch telemedicine users");
-      }
+      const response = await apiRequest("GET", "/api/telemedicine/users");
       return response.json();
     },
     enabled: true,
@@ -1117,6 +1108,12 @@ function PatientList({ telemedicineSettings }: { telemedicineSettings?: Telemedi
               <div className="flex items-center gap-3 mb-3">
                 <div className="relative">
                   <Avatar className="w-12 h-12">
+                    {(patient.profilePicturePath || patient.profile_picture_path) && (
+                      <AvatarImage
+                        src={patient.profilePicturePath || patient.profile_picture_path}
+                        alt="Profile picture"
+                      />
+                    )}
                     <AvatarFallback>
                       {patient.firstName?.[0] || patient.email?.[0]}
                       {patient.lastName?.[0] || patient.email?.[1]}
@@ -1286,6 +1283,7 @@ function PatientList({ telemedicineSettings }: { telemedicineSettings?: Telemedi
                   user ? `${user.firstName} ${user.lastName}` : "Provider"
                 }
                 participantRole={user?.role}
+                participantImageUrl={myProfileImageUrl}
                 token={liveKitVideoCall.token}
                 serverUrl={liveKitVideoCall.serverUrl}
                 onDisconnect={handleLiveKitVideoCallEnd}
@@ -1320,6 +1318,7 @@ function PatientList({ telemedicineSettings }: { telemedicineSettings?: Telemedi
                   user ? `${user.firstName} ${user.lastName}` : "Provider"
                 }
                 participantRole={user?.role}
+                participantImageUrl={myProfileImageUrl}
                 token={liveKitAudioCall.token}
                 serverUrl={liveKitAudioCall.serverUrl}
                 onDisconnect={handleLiveKitAudioCallEnd}
@@ -1377,6 +1376,22 @@ export default function Telemedicine() {
   const [callNotes, setCallNotes] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [telemedicineSettings, setTelemedicineSettings] = useState<TelemedicineSettings>(() => loadTelemedicineSettingsFromStorage());
+
+  // Current user details (includes profilePicturePath)
+  const { data: currentUserDetails } = useQuery<any>({
+    queryKey: ["/api/users/current"],
+    enabled: !!user,
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/users/current");
+      return res.json();
+    },
+    retry: false,
+    staleTime: 30000,
+  });
+  const myProfileImageUrl: string | null =
+    (currentUserDetails?.profilePicturePath as string | null | undefined) ||
+    ((user as any)?.profilePicturePath as string | null | undefined) ||
+    null;
 
   // Fetch telemedicine settings from database (GET)
   const { data: savedSettings, refetch: refetchTelemedicineSettings } = useQuery({
@@ -1483,16 +1498,7 @@ export default function Telemedicine() {
   const { data: patients, isLoading: patientsLoading } = useQuery({
     queryKey: ["/api/telemedicine/users"],
     queryFn: async () => {
-      const token = localStorage.getItem("auth_token");
-      const response = await fetch("/api/telemedicine/users", {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "X-Tenant-Subdomain": getActiveSubdomain(),
-        },
-      });
-      if (!response.ok) {
-        throw new Error("Failed to fetch telemedicine users");
-      }
+      const response = await apiRequest("GET", "/api/telemedicine/users");
       return response.json();
     },
     enabled: true,

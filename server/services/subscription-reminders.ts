@@ -220,12 +220,12 @@ export async function runSubscriptionExpiryAutomation(): Promise<void> {
       await db.transaction(async (tx) => {
         await tx
           .update(saasSubscriptions)
-          .set({ status: "expired", updatedAt: new Date() })
+          .set({ status: "expired", paymentStatus: "expired", updatedAt: new Date() })
           .where(eq(saasSubscriptions.id, subscription.id));
 
         await tx
           .update(organizations)
-          .set({ subscriptionStatus: "inactive", updatedAt: new Date() })
+          .set({ subscriptionStatus: "expired", paymentStatus: "expired", updatedAt: new Date() })
           .where(eq(organizations.id, subscription.organizationId));
       });
 

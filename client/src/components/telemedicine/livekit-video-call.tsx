@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { useLiveKitRoom } from "@/hooks/use-livekit-room";
 import { LiveKitControls } from "./livekit-controls";
 import { Card, CardContent } from "@/components/ui/card";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Video, VideoOff, User } from "lucide-react";
 import { RemoteParticipant, Track, RoomEvent } from "livekit-client";
 
@@ -10,6 +10,7 @@ interface LiveKitVideoCallProps {
   roomName: string;
   participantName: string;
   participantRole?: string;
+  participantImageUrl?: string | null;
   token?: string;
   serverUrl?: string;
   onDisconnect?: (disconnectedParticipant?: { name: string; role?: string }) => void;
@@ -22,6 +23,7 @@ export function LiveKitVideoCall({
   roomName,
   participantName,
   participantRole,
+  participantImageUrl,
   token,
   serverUrl,
   onDisconnect,
@@ -400,6 +402,9 @@ export function LiveKitVideoCall({
           ) : (
             <div className="w-full h-full flex items-center justify-center bg-gray-800">
               <Avatar className="w-16 h-16">
+                {participantImageUrl ? (
+                  <AvatarImage src={participantImageUrl} alt="Profile picture" />
+                ) : null}
                 <AvatarFallback>
                   <User className="w-8 h-8" />
                 </AvatarFallback>

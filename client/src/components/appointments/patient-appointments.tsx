@@ -43,6 +43,7 @@ import {
   CheckCircle,
   ChevronsUpDown,
   Check,
+  Stethoscope,
   Loader2,
 } from "lucide-react";
 import { format, isSameDay, isToday, isFuture, isPast } from "date-fns";
@@ -54,9 +55,12 @@ import { cn } from "@/lib/utils";
 import {
   getAppointmentCardTimeKind,
   appointmentOngoingBadgePositionClassName,
+  appointmentOngoingBadgeClassName,
   appointmentCardTimeBackgroundClass,
+  sortAppointmentsByCardTimeKind,
   useAppointmentTimeTick,
 } from "@/lib/appointment-card-time-style";
+import { addMinutes } from "date-fns";
 
 const statusColors = {
   scheduled: "#4A7DFF",
@@ -64,6 +68,59 @@ const statusColors = {
   cancelled: "#162B61",
   no_show: "#9B9EAF",
 };
+
+function formatStatusLabelPatientAppointments(status: unknown): string {
+  const raw = String(status ?? "").trim();
+  if (!raw) return "UNKNOWN";
+  return raw.replace(/\s+/g, "_").toUpperCase();
+}
+
+function getStatusBadgePresentation(status: unknown): { className: string; style?: React.CSSProperties } {
+  const s = String(status ?? "").toLowerCase().trim().replace(/\s+/g, "_");
+  if (s === "in_progress") {
+    return {
+      className:
+        "bg-white text-yellow-700 border border-yellow-400 dark:bg-transparent dark:text-yellow-300 dark:border-yellow-700",
+    };
+  }
+  if (s === "completed") {
+    return {
+      className:
+        "bg-white text-green-700 border border-green-500 dark:bg-transparent dark:text-green-300 dark:border-green-700",
+    };
+  }
+  if (s === "rescheduled") {
+    return {
+      className:
+        "bg-gray-100 text-gray-900 border border-black/60 dark:bg-slate-800/40 dark:text-gray-100 dark:border-gray-500/70",
+    };
+  }
+
+  const key = s as keyof typeof statusColors;
+  const bg = statusColors[key];
+  if (bg) {
+    return { className: "text-white border-0", style: { backgroundColor: bg } };
+  }
+  return { className: "bg-gray-100 text-gray-800 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600" };
+}
+
+function formatAppointmentTimeRangeLikeCalendar(
+  appointment: { scheduledAt?: string | Date; duration?: number },
+  parseScheduledAtLocal: (v: string | Date) => Date,
+): string {
+  try {
+    const start = parseScheduledAtLocal(appointment.scheduledAt ?? "");
+    if (Number.isNaN(start.getTime())) return "Time unavailable";
+    const dur =
+      appointment.duration != null && Number(appointment.duration) > 0
+        ? Number(appointment.duration)
+        : 30;
+    const end = addMinutes(start, dur);
+    return `${format(start, "h:mm a")} TO ${format(end, "h:mm a")} • ${dur} min`;
+  } catch {
+    return "Time unavailable";
+  }
+}
 
 export default function PatientAppointments({
   onNewAppointment,
@@ -112,10 +169,7 @@ export default function PatientAppointments({
   const appointmentTimeTick = useAppointmentTimeTick();
   const nowForCardStyle = React.useMemo(() => new Date(), [appointmentTimeTick]);
 
-  /** Lighter green than calendar default for "Ongoing" badge on patient list. */
-  const patientOngoingBadgeClassName =
-    "bg-emerald-50 text-emerald-800 border border-emerald-100/90 dark:bg-emerald-950/30 dark:text-emerald-100 dark:border-emerald-800/45 " +
-    "text-[10px] font-semibold uppercase tracking-wide shadow-sm";
+  // Keep ongoing badge styling aligned with appointment-calendar.tsx
 
   // Helper function to normalize status values for case-insensitive filtering
   const normalizeStatus = (s?: string) => (s || '').toLowerCase().replace(/\s+/g, '_');
@@ -1705,8 +1759,8 @@ export default function PatientAppointments({
 
   // Filter and sort appointments by date for the logged-in patient
   const base = user?.role === "patient" ? getPatientFilteredAppointments : appointments;
-  const filteredAppointments = base
-    .filter((apt: any) => {
+  const filteredAppointments = sortAppointmentsByCardTimeKind(
+    base.filter((apt: any) => {
       const appointmentDate = parseScheduledAtAsLocal(apt.scheduledAt);
 
       if (selectedFilter === "upcoming") {
@@ -1715,11 +1769,10 @@ export default function PatientAppointments({
         return isPast(appointmentDate) && !isToday(appointmentDate);
       }
       return true;
-    })
-    .sort(
-      (a: any, b: any) =>
-        parseScheduledAtAsLocal(b.scheduledAt).getTime() - parseScheduledAtAsLocal(a.scheduledAt).getTime(),
-    );
+    }),
+    nowForCardStyle,
+    parseScheduledAtAsLocal,
+  );
 
   // Get upcoming appointments for the logged-in patient
   const upcomingAppointments = appointments.filter((apt: any) => {
@@ -1861,7 +1914,7 @@ export default function PatientAppointments({
   return (
     <div className="space-y-6 overflow-x-hidden" data-testid="patient-appointments-view">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between min-w-0">
         <div className="flex items-center space-x-4">
           <div>
             <h2 className="text-2xl font-bold text-blue-800 dark:text-blue-300">
@@ -1872,7 +1925,7 @@ export default function PatientAppointments({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2 flex-wrap justify-end">
+        <div className="flex items-center gap-2 flex-wrap justify-end min-w-0">
           {user?.role === "patient" && relationFilterOptions.length > 0 && (
             <div className="flex items-center gap-2">
               <Label htmlFor="relation-filter" className="text-sm text-muted-foreground whitespace-nowrap sr-only sm:not-sr-only sm:inline">
@@ -1978,17 +2031,17 @@ export default function PatientAppointments({
                   </div>
                 )}
               </div>
-              <Badge
-                style={{
-                  backgroundColor:
-                    statusColors[
-                      nextAppointment.status as keyof typeof statusColors
-                    ],
-                }}
-                className="text-white text-sm"
-              >
-                {nextAppointment.status.toUpperCase()}
-              </Badge>
+              {(() => {
+                const pres = getStatusBadgePresentation(nextAppointment.status);
+                return (
+                  <Badge
+                    style={pres.style}
+                    className={cn("shrink-0 text-sm", pres.className)}
+                  >
+                    {formatStatusLabelPatientAppointments(nextAppointment.status)}
+                  </Badge>
+                );
+              })()}
             </div>
           </CardContent>
         </Card>
@@ -2133,7 +2186,12 @@ export default function PatientAppointments({
       </div>
 
       {/* Appointments List */}
-      <div className={`space-y-4 ${user?.role === 'patient' ? 'max-h-[700px] overflow-y-auto' : ''}`}>
+      <div
+        className={cn(
+          // Keep cards from stretching across very wide screens
+          "space-y-4 overflow-x-hidden min-w-0 w-full max-w-5xl mx-auto",
+        )}
+      >
         {filteredAppointments.length === 0 ? (
           <Card>
             <CardContent className="p-8 text-center">
@@ -2169,7 +2227,9 @@ export default function PatientAppointments({
               <Card
                 key={appointment.id}
                 className={cn(
-                  "relative overflow-visible border rounded-lg pt-8",
+                  // Allow top-right badges to sit slightly outside the card.
+                  // (Badge uses negative top/right, so `overflow-hidden` would clip it.)
+                  "relative overflow-visible border rounded-lg pt-6 w-full max-w-full",
                   appointmentCardTimeBackgroundClass(cardTimeKind),
                   "ring-inset hover:ring-1 hover:ring-gray-200 dark:hover:ring-gray-600",
                 )}
@@ -2186,8 +2246,9 @@ export default function PatientAppointments({
                 })() && (
                   <Badge
                     className={cn(
-                      patientOngoingBadgeClassName,
-                      appointmentOngoingBadgePositionClassName,
+                      appointmentOngoingBadgeClassName,
+                      // Render fully inside card (avoid clipping by parent overflow)
+                      "absolute z-20 top-2 right-2 shadow-sm h-5 px-2 py-0 text-[10px] leading-5",
                     )}
                   >
                     Ongoing
@@ -2208,7 +2269,7 @@ export default function PatientAppointments({
                 })() && (
                   <Badge
                     className={cn(
-                      appointmentOngoingBadgePositionClassName,
+                      "absolute z-20 top-2 right-2 shadow-sm",
                       "bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600 text-xs",
                     )}
                   >
@@ -2219,29 +2280,19 @@ export default function PatientAppointments({
                   Number(appointment.id) === Number(nextUpcomingAppointmentId) && (
                     <Badge
                       className={cn(
-                        appointmentOngoingBadgePositionClassName,
+                        "absolute z-20 top-2 right-2 shadow-sm",
                         "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 text-xs",
                       )}
                     >
                       Next
                     </Badge>
                   )}
-                <CardContent className="p-6">
-                  {user?.role === 'patient' && appointment.appointmentId && (
-                    <div className="mb-3">
-                      <Badge 
-                        variant="outline" 
-                        className="bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-700 text-xs font-medium"
-                      >
-                        {appointment.appointmentId}
-                      </Badge>
-                    </div>
-                  )}
-              <div className="flex items-center justify-between">
-                    <div className="space-y-3 flex-1">
-                      <div className="flex items-center justify-between">
+                <CardContent className="p-4 sm:p-5 min-w-0">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between min-w-0">
+                    <div className="space-y-3 flex-1 min-w-0">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between min-w-0">
                         <div className="flex flex-wrap items-center gap-2 min-w-0">
-                          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 min-w-0 truncate">
                             {formatAppointmentTitle(appointment)}
                           </h3>
                           {user?.role === "patient" && relationLabel && (
@@ -2253,8 +2304,17 @@ export default function PatientAppointments({
                               {relationLabel}
                             </Badge>
                           )}
+                          {user?.role === "patient" && appointment.appointmentId && (
+                            <Badge
+                              variant="outline"
+                              className="bg-transparent text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-700 text-xs font-medium shrink-0 max-w-full break-all"
+                              data-testid={`badge-appointment-id-${appointment.id}`}
+                            >
+                              {appointment.appointmentId}
+                            </Badge>
+                          )}
                         </div>
-                        <div className="flex items-center space-x-2">
+                        <div className="flex items-center gap-2 flex-wrap justify-end">
                           {normalizeStatus(appointment.status) !== "cancelled" && (
                             <Button
                               variant="ghost"
@@ -2292,89 +2352,120 @@ export default function PatientAppointments({
                               <Trash2 className="h-4 w-4 text-red-600 dark:text-red-400" />
                             </Button>
                           )}
-                          <Badge
-                            style={{
-                              backgroundColor:
-                                statusColors[
-                                  appointment.status as keyof typeof statusColors
-                                ],
-                            }}
-                            className="text-white"
-                          >
-                            {appointment.status.toUpperCase()}
-                          </Badge>
+                          {(() => {
+                            const pres = getStatusBadgePresentation(appointment.status);
+                            return (
+                              <Badge
+                                style={pres.style}
+                                className={cn("shrink-0", pres.className)}
+                              >
+                                {formatStatusLabelPatientAppointments(appointment.status)}
+                              </Badge>
+                            );
+                          })()}
                         </div>
                       </div>
 
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="flex items-center space-x-2">
-                          <Clock className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                          <span className="text-sm text-gray-700 dark:text-gray-300">
-                            {formatDate(appointment.scheduledAt)}
-                          </span>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 min-w-0">
+                        {/* Left column */}
+                        <div className="space-y-3 min-w-0">
+                          {/* Date + Time + Duration */}
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Clock className="h-4 w-4 text-gray-400 dark:text-gray-500 shrink-0" />
+                            <span className="text-sm text-gray-700 dark:text-gray-300 min-w-0 truncate">
+                              {formatDate(appointment.scheduledAt)}{" "}
+                              <span className="text-gray-400 dark:text-gray-500">•</span>{" "}
+                              <span className="font-medium">
+                                {formatAppointmentTimeRangeLikeCalendar(
+                                  appointment,
+                                  parseScheduledAtAsLocal,
+                                )}
+                              </span>
+                            </span>
+                          </div>
+
+                          {/* Provider */}
+                          {getDoctorSpecialtyData(appointment.providerId).name && (
+                            <div className="flex items-center space-x-2">
+                              <Stethoscope className="h-4 w-4 text-gray-400 dark:text-gray-500" />
+                              <span className="text-sm text-gray-700 dark:text-gray-300">
+                                {getDoctorSpecialtyData(appointment.providerId).name}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Dermatologist (subSpecialty) */}
+                          {user?.role === "patient" &&
+                            getDoctorSpecialtyData(appointment.providerId).subSpecialty && (
+                              <div className="flex items-center space-x-2">
+                                <FileText className="h-4 w-4 text-gray-400 dark:text-gray-500" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300">
+                                  {getDoctorSpecialtyData(appointment.providerId).subSpecialty}
+                                </span>
+                              </div>
+                            )}
+
+                          {/* Location (e.g. Neurosurgery) */}
+                          {appointment.location && (
+                            <div className="flex items-center space-x-2">
+                              <MapPin className="h-4 w-4 text-gray-400 dark:text-gray-500" />
+                              <span className="text-sm text-gray-700 dark:text-gray-300">
+                                {appointment.location}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Patient-only: Service + Appointment Type under provider + dermatologist */}
                         </div>
-                        <div className="flex items-center space-x-2">
-                          <Clock className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                          <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                            {formatTime(appointment.scheduledAt)}
-                          </span>
-                        </div>
-                        <div className="flex items-center space-x-2">
-                          <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                          <span className="text-sm text-gray-700 dark:text-gray-300">
-                            {aptPatient
-                              ? `${aptPatient.firstName ?? ""} ${aptPatient.lastName ?? ""}`.trim() || "Patient"
-                              : currentPatient
-                                ? `${currentPatient.firstName} ${currentPatient.lastName}`
-                                : "Patient"}
-                          </span>
-                        </div>
-                        {getDoctorSpecialtyData(appointment.providerId)
-                          .name && (
+
+                        {/* Right column */}
+                        <div className="space-y-3 min-w-0">
+                          {/* Patient */}
                           <div className="flex items-center space-x-2">
                             <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
                             <span className="text-sm text-gray-700 dark:text-gray-300">
-                              {
-                                getDoctorSpecialtyData(appointment.providerId)
-                                  .name
-                              }
+                              {aptPatient
+                                ? `${aptPatient.firstName ?? ""} ${aptPatient.lastName ?? ""}`.trim() || "Patient"
+                                : currentPatient
+                                  ? `${currentPatient.firstName} ${currentPatient.lastName}`
+                                  : "Patient"}
                             </span>
                           </div>
-                        )}
-                        {user?.role === 'patient' && getDoctorSpecialtyData(appointment.providerId)
-                          .category && (
-                          <div className="flex items-center space-x-2">
-                            <FileText className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                            <span className="text-sm text-gray-700 dark:text-gray-300">
-                              {
-                                getDoctorSpecialtyData(appointment.providerId)
-                                  .category
-                              }
-                            </span>
-                          </div>
-                        )}
-                        {user?.role === 'patient' && getDoctorSpecialtyData(appointment.providerId)
-                          .subSpecialty && (
-                          <div className="flex items-center space-x-2">
-                            <FileText className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                            <span className="text-sm text-gray-700 dark:text-gray-300">
-                              {
-                                getDoctorSpecialtyData(appointment.providerId)
-                                  .subSpecialty
-                              }
-                            </span>
-                          </div>
-                        )}
-                      </div>
 
-                      {appointment.location && (
-                        <div className="flex items-center space-x-2">
-                          <MapPin className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                          <span className="text-sm text-gray-700 dark:text-gray-300">
-                            {appointment.location}
-                          </span>
+                          {/* Category (e.g. Skin, Hair & Appearance) */}
+                          {user?.role === "patient" &&
+                            getDoctorSpecialtyData(appointment.providerId).category && (
+                              <div className="flex items-center space-x-2">
+                                <FileText className="h-4 w-4 text-gray-400 dark:text-gray-500" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300">
+                                  {getDoctorSpecialtyData(appointment.providerId).category}
+                                </span>
+                              </div>
+                            )}
+
+                          {/* Patient-only: Service + Appointment Type after category */}
+                          {user?.role === "patient" && serviceInfo && (
+                            <div className="flex flex-col items-start gap-1 pt-1">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className="inline-flex h-2 w-2 rounded-full border border-gray-300 dark:border-gray-600"
+                                  style={{ backgroundColor: serviceInfo.color }}
+                                />
+                                <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
+                                  Service: {serviceInfo.name}
+                                </span>
+                              </div>
+                              <div className="text-sm text-gray-500 dark:text-gray-400">
+                                Appointment Type:{" "}
+                                {(serviceInfo.type || "consultation")
+                                  .toString()
+                                  .replace(/_/g, " ")
+                                  .replace(/\b\w/g, (char: string) => char.toUpperCase())}
+                              </div>
+                            </div>
+                          )}
                         </div>
-                      )}
+                      </div>
 
                       {appointment.isVirtual && (
                         <div className="flex items-center space-x-2">
@@ -2386,30 +2477,9 @@ export default function PatientAppointments({
                       )}
 
                       {appointment.description && (
-                        <p className="text-sm text-gray-600 dark:text-gray-300 bg-gray-50 dark:bg-gray-700/50 p-3 rounded">
+                        <p className="text-sm text-gray-600 dark:text-gray-300 bg-gray-50 dark:bg-gray-700/50 p-2 rounded">
                           {appointment.description}
                         </p>
-                      )}
-
-                      {serviceInfo && (
-                        <>
-                          <div className="flex items-center space-x-2 mt-2">
-                            <span
-                              className="inline-flex h-2 w-2 rounded-full border border-gray-300 dark:border-gray-600"
-                              style={{ backgroundColor: serviceInfo.color }}
-                            />
-                            <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                              Service: {serviceInfo.name}
-                            </span>
-                          </div>
-                          <div className="text-xs text-gray-500 dark:text-gray-400">
-                            Appointment Type:{" "}
-                            {(serviceInfo.type || "consultation")
-                              .toString()
-                              .replace(/_/g, " ")
-                              .replace(/\b\w/g, (char: string) => char.toUpperCase())}
-                          </div>
-                        </>
                       )}
 
                       {appointment.createdBy && getCreatorName(appointment.createdBy) && (

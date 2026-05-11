@@ -1102,6 +1102,34 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     },
   });
 
+  const rescheduleAndCreateAppointmentMutation = useMutation({
+    mutationFn: async ({ existingId, createPayload }: { existingId: number; createPayload: any }) => {
+      await apiRequest("PATCH", `/api/appointments/${existingId}`, { status: "rescheduled" });
+      const res = await apiRequest("POST", "/api/appointments", {
+        ...createPayload,
+        status: "scheduled",
+        rescheduledFromId: existingId,
+      });
+      return res.json();
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+      setShowDuplicateWarning(false);
+      setDuplicateAppointment(null);
+      setDuplicateAppointmentDetails("");
+      setPendingDuplicateCreatePayload(null);
+      toast({ title: "Appointment rescheduled" });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Reschedule failed",
+        description: error?.message || "Unable to reschedule appointment.",
+        variant: "destructive",
+      });
+    },
+  });
+
   // Cancel appointment mutation
   const cancelAppointmentMutation = useMutation({
     mutationFn: async (appointmentId: number) => {
@@ -2135,6 +2163,44 @@ Medical License: [License Number]
       appointmentSelectedTreatment,
       appointmentSelectedConsultation,
     ]
+  );
+
+  // Patient-only duplicate detection: same patient + provider + same service, any date/time
+  const findDuplicateServiceAppointmentAnyDate = useCallback(
+    (patientIdStr: string, appointmentsList?: any[]) => {
+      const list = appointmentsList ?? appointmentsData;
+      if (!list || !selectedProviderId || !appointmentType) return null;
+      const normType = appointmentType as "treatment" | "consultation";
+      const tid = normType === "treatment" ? appointmentSelectedTreatment?.id ?? null : null;
+      const cid = normType === "consultation" ? appointmentSelectedConsultation?.id ?? null : null;
+
+      if (normType === "treatment" && tid == null) return null;
+      if (normType === "consultation" && cid == null) return null;
+
+      return (
+        list.find((apt: any) => {
+          if (!isServiceDuplicateBlockingStatus(apt.status)) return false;
+          const aptPatient = apt.patientId ?? apt.patient_id;
+          const aptProvider = apt.providerId ?? apt.provider_id;
+          if (String(aptPatient) !== patientIdStr) return false;
+          if (String(aptProvider) !== selectedProviderId) return false;
+          const aptKind = String(apt.appointmentType || apt.appointment_type || "").toLowerCase();
+          if (normType === "treatment") {
+            const aptTid = apt.treatmentId ?? apt.treatment_id;
+            return aptKind === "treatment" && Number(aptTid) === Number(tid);
+          }
+          const aptCid = apt.consultationId ?? apt.consultation_id;
+          return aptKind === "consultation" && Number(aptCid) === Number(cid);
+        }) ?? null
+      );
+    },
+    [
+      appointmentsData,
+      selectedProviderId,
+      appointmentType,
+      appointmentSelectedTreatment,
+      appointmentSelectedConsultation,
+    ],
   );
 
   useEffect(() => {
@@ -5464,7 +5530,7 @@ Medical License: [License Number]
                       }
                     }
                     
-                    // Same doctor + patient + date + same treatment/consultation — only blocks if existing row is Scheduled or Confirmed
+                    // Patient: Same doctor + patient + same treatment/consultation — if an active appointment exists at any datetime, prompt reschedule
                     if (user?.role === "patient" && appointmentsData && newAppointmentDate && selectedProviderId) {
                       let patientDbId = newAppointmentData.patientId;
                       if (!patientDbId && patientsData && user?.id) {
@@ -5479,7 +5545,7 @@ Medical License: [License Number]
                       }
 
                       if (patientDbId) {
-                        const foundDup = findDuplicateServiceAppointment(
+                        const foundDup = findDuplicateServiceAppointmentAnyDate(
                           String(patientDbId),
                           appointmentsForOverlap,
                         );
@@ -6873,55 +6939,55 @@ Medical License: [License Number]
             </div>
           )}
 
-          {(user?.role === "admin" || isDoctorLike(user?.role)) &&
-            duplicateAppointment &&
+          {duplicateAppointment &&
             Number.isFinite(Number(duplicateAppointment.id)) &&
             isServiceDuplicateBlockingStatus(
               duplicateAppointment.status ?? duplicateAppointment.dup_status,
             ) && (
               <div className="mt-2 space-y-3 rounded-md border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
                 <Label className="text-sm font-medium leading-snug text-amber-950 dark:text-amber-100">
-                  Click <strong>Rescheduled</strong> to mark the existing appointment as rescheduled. After updating,
-                  you can review and confirm the new appointment in the summary popup.
+                  Click <strong>Reschedule</strong> to mark the existing appointment as rescheduled and create the new one as scheduled.
                 </Label>
                 <Button
                   type="button"
                   className="w-full"
-                  disabled={resolveDuplicateStatusMutation.isPending}
+                  disabled={rescheduleAndCreateAppointmentMutation.isPending}
                   onClick={() => {
                     const id = Number(duplicateAppointment.id);
                     if (!Number.isFinite(id)) return;
-                    // Ensure the new appointment confirmation has all required data (built from current selections).
-                    if (!pendingDuplicateCreatePayload) {
-                      const normalizedAppointmentType = appointmentType || "consultation";
-                      const treatmentId = normalizedAppointmentType === "treatment"
+
+                    const normalizedAppointmentType = appointmentType || "consultation";
+                    const treatmentId =
+                      normalizedAppointmentType === "treatment"
                         ? appointmentSelectedTreatment?.id || null
                         : null;
-                      const consultationId = normalizedAppointmentType === "consultation"
+                    const consultationId =
+                      normalizedAppointmentType === "consultation"
                         ? appointmentSelectedConsultation?.id || null
                         : null;
 
-                      // Build scheduledAt from currently selected date/time in the modal
-                      if (!newAppointmentDate || !newSelectedTimeSlot || !selectedProviderId || !newAppointmentData?.patientId) {
-                        toast({
-                          title: "Missing details",
-                          description: "Please select patient, provider, date, and time before rescheduling.",
-                          variant: "destructive",
-                        });
-                        return;
-                      }
-                      const selectedDate = format(newAppointmentDate, "yyyy-MM-dd");
-                      const [time, period] = newSelectedTimeSlot.split(" ");
-                      const [hours, minutes] = time.split(":");
-                      let hour24 = parseInt(hours);
-                      if (period === "PM" && hour24 !== 12) hour24 += 12;
-                      else if (period === "AM" && hour24 === 12) hour24 = 0;
-                      const newScheduledAt = `${selectedDate}T${hour24.toString().padStart(2, "0")}:${minutes}:00`;
+                    if (!newAppointmentDate || !newSelectedTimeSlot || !selectedProviderId || !newAppointmentData?.patientId) {
+                      toast({
+                        title: "Missing details",
+                        description: "Please select patient, provider, date, and time before rescheduling.",
+                        variant: "destructive",
+                      });
+                      return;
+                    }
+                    const selectedDate = format(newAppointmentDate, "yyyy-MM-dd");
+                    const [time, period] = newSelectedTimeSlot.split(" ");
+                    const [hours, minutes] = time.split(":");
+                    let hour24 = parseInt(hours);
+                    if (period === "PM" && hour24 !== 12) hour24 += 12;
+                    else if (period === "AM" && hour24 === 12) hour24 = 0;
+                    const newScheduledAt = `${selectedDate}T${hour24.toString().padStart(2, "0")}:${minutes}:00`;
 
-                      const patientName = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
-                      const generatedTitle = `${patientName?.firstName || 'Patient'} - ${selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1)} Appointment`;
+                    const patientName = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
+                    const generatedTitle = `${patientName?.firstName || "Patient"} - ${selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1)} Appointment`;
 
-                      setPendingDuplicateCreatePayload({
+                    const createPayload =
+                      pendingDuplicateCreatePayload ||
+                      ({
                         patientId: parseInt(newAppointmentData.patientId),
                         providerId: parseInt(selectedProviderId),
                         assignedRole: selectedRole,
@@ -6932,23 +6998,19 @@ Medical License: [License Number]
                         treatment_id: treatmentId,
                         consultationId,
                         consultation_id: consultationId,
-                        status: "scheduled",
                         scheduledAt: newScheduledAt,
                         duration: selectedDuration,
                         description: "",
                         createdBy: user?.id,
-                      });
-                    }
-                    setDuplicateResolveStatus("rescheduled");
-                    resolveDuplicateStatusMutation.mutate({
-                      id,
-                      status: "rescheduled",
+                      } as any);
+
+                    rescheduleAndCreateAppointmentMutation.mutate({
+                      existingId: id,
+                      createPayload,
                     });
                   }}
                 >
-                  {resolveDuplicateStatusMutation.isPending
-                    ? "Rescheduling..."
-                    : "Rescheduled"}
+                  {rescheduleAndCreateAppointmentMutation.isPending ? "Rescheduling..." : "Reschedule"}
                 </Button>
               </div>
             )}

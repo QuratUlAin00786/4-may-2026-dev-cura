@@ -88,12 +88,14 @@ export const appointmentOngoingBadgePositionClassName =
 export function appointmentCardTimeBackgroundClass(kind: AppointmentCardTimeKind): string {
   switch (kind) {
     case "ongoing":
-      return "bg-green-50 dark:bg-green-950/20 border-green-100/90 dark:border-green-900/45";
+      // Use white border in light mode for cleaner cards
+      return "bg-green-50 dark:bg-green-950/20 border-white/80 dark:border-green-900/45";
     case "past":
-      return "bg-gray-50 dark:bg-slate-800/25 border-gray-100 dark:border-slate-700/70";
+      // Keep passed appointments readable (white background like others)
+      return "bg-white dark:bg-slate-800 border-white dark:border-slate-700";
     case "upcoming":
     default:
-      return "bg-white dark:bg-slate-800 border-gray-200 dark:border-gray-700";
+      return "bg-white dark:bg-slate-800 border-white dark:border-gray-700";
   }
 }
 

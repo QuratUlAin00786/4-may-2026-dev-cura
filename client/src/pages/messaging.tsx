@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -636,6 +636,35 @@ export default function MessagingPage() {
 
     console.log('🔍 OTHER PARTICIPANT FOUND:', otherParticipant);
     return otherParticipant || conversation.participants[0];
+  };
+
+  const getProfilePicturePathByRoleAndId = (role: string | undefined, id: string | number | undefined) => {
+    if (!id) return null;
+    const roleLower = String(role || "").toLowerCase();
+    const idStr = String(id);
+
+    if (roleLower === "patient") {
+      const patient = (patientsData || []).find(
+        (p: any) => String(p.userId) === idStr || String(p.id) === idStr,
+      );
+      return (
+        patient?.profilePicturePath ||
+        patient?.profile_picture_path ||
+        null
+      );
+    }
+
+    const u = (usersData || []).find((x: any) => String(x.id) === idStr);
+    return u?.profilePicturePath || u?.profile_picture_path || null;
+  };
+
+  const getParticipantProfilePicturePath = (participant: any) => {
+    return (
+      participant?.profilePicturePath ||
+      participant?.profile_picture_path ||
+      participant?.avatar ||
+      getProfilePicturePathByRoleAndId(participant?.role, participant?.id)
+    );
   };
 
   // LiveKit call helpers
@@ -4725,6 +4754,7 @@ export default function MessagingPage() {
                                   ? `User ${otherParticipant.id}`
                                   : 'Unknown User';
                               const participantRole = otherParticipant?.role || 'user';
+                              const participantImageUrl = getParticipantProfilePicturePath(otherParticipant);
                               // Use the same timestamp formatting function for consistency
                               const lastMessageTimestamp = conversation.lastMessage?.timestamp
                                 ? formatTimestampNoConversion(conversation.lastMessage.timestamp)
@@ -4773,6 +4803,9 @@ export default function MessagingPage() {
                                     {/* Avatar */}
                                     <div className="relative flex-shrink-0">
                                       <Avatar className="h-8 w-8">
+                                        {participantImageUrl ? (
+                                          <AvatarImage src={participantImageUrl} alt="Profile picture" />
+                                        ) : null}
                                         <AvatarFallback className="bg-green-500 text-white text-xs font-semibold">
                                           {String(participantName).charAt(0).toUpperCase()}
                                         </AvatarFallback>
@@ -4856,6 +4889,12 @@ export default function MessagingPage() {
                     <div className="p-2.5 border-b border-gray-200 dark:border-slate-600 flex items-center justify-between flex-shrink-0">
                       <div className="flex items-center gap-2">
                         <Avatar className="h-8 w-8">
+                          {(() => {
+                            const conv = conversations.find((c: Conversation) => c.id === selectedConversation);
+                            const other = conv ? getOtherParticipant(conv) : null;
+                            const url = getParticipantProfilePicturePath(other);
+                            return url ? <AvatarImage src={url} alt="Profile picture" /> : null;
+                          })()}
                           <AvatarFallback className="text-xs">
                             {(() => {
                               const conv = conversations.find((c: Conversation) => c.id === selectedConversation);
@@ -4990,6 +5029,10 @@ export default function MessagingPage() {
                                 {/* Avatar - only show for received messages */}
                                 {!isSentByCurrentUser && (
                                   <Avatar className="h-6 w-6 flex-shrink-0">
+                                    {(() => {
+                                      const url = getProfilePicturePathByRoleAndId(message.senderRole, message.senderId);
+                                      return url ? <AvatarImage src={url} alt="Profile picture" /> : null;
+                                    })()}
                                     <AvatarFallback className="text-[10px] bg-gray-400 text-white">
                                       {message.senderName?.charAt(0) || 'U'}
                                     </AvatarFallback>

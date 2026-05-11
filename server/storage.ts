@@ -7468,6 +7468,9 @@ export class DatabaseStorage implements IStorage {
       organizationPaymentStatus: organizations.paymentStatus,
       computedSubscriptionStatus: sql<string>`
         CASE
+          WHEN ${saasSubscriptions.status} IS NOT NULL
+            AND LOWER(${saasSubscriptions.status}) NOT IN ('trial', 'active')
+            THEN ${saasSubscriptions.status}
           WHEN ${saasSubscriptions.expiresAt} IS NOT NULL AND ${saasSubscriptions.expiresAt} <= now()
             THEN 'expired'
           ELSE ${organizations.subscriptionStatus}
@@ -7975,24 +7978,55 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateSaaSSubscription(subscriptionId: number, updates: Partial<InsertSaaSSubscription>): Promise<any> {
-    const [updated] = await db
-      .update(saasSubscriptions)
-      .set({
-        ...updates,
-        expiresAt: (() => {
-          if (updates.expiresAt) return updates.expiresAt;
-          if (updates.currentPeriodEnd) {
-            return addDays(new Date(updates.currentPeriodEnd), GRACE_PERIOD_DAYS);
-          }
-          return undefined;
-        })(),
-        updatedAt: new Date(),
-      })
-      .where(eq(saasSubscriptions.id, subscriptionId))
-      .returning();
+    const updated = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(saasSubscriptions)
+        .set({
+          ...updates,
+          paymentStatus: (() => {
+            if (updates.paymentStatus) return updates.paymentStatus;
+            if (typeof updates.status === "string" && updates.status.trim().toLowerCase() === "expired") {
+              return "expired";
+            }
+            return undefined;
+          })(),
+          expiresAt: (() => {
+            if (updates.expiresAt) return updates.expiresAt;
+            if (updates.currentPeriodEnd) {
+              return addDays(new Date(updates.currentPeriodEnd), GRACE_PERIOD_DAYS);
+            }
+            return undefined;
+          })(),
+          updatedAt: new Date(),
+        })
+        .where(eq(saasSubscriptions.id, subscriptionId))
+        .returning();
+
+      if (!row) return null;
+
+      // Keep organization.subscription_status aligned with subscription status.
+      if (typeof updates.status === "string" && updates.status.trim().length > 0) {
+        const nextStatus = updates.status.trim();
+        const nextPaymentStatus =
+          nextStatus.toLowerCase() === "expired" ? "expired" : undefined;
+
+        await tx
+          .update(organizations)
+          .set({
+            subscriptionStatus: nextStatus,
+            ...(nextPaymentStatus ? { paymentStatus: nextPaymentStatus } : {}),
+            updatedAt: new Date(),
+          })
+          .where(eq(organizations.id, row.organizationId));
+      }
+
+      return row;
+    });
+
     if (updated) {
       subscriptionCache.invalidate(updated.organizationId);
     }
+
     return updated || null;
   }
 

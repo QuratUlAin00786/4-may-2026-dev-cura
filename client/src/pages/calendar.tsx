@@ -159,10 +159,60 @@ function isServiceDuplicateBlockingStatusCal(status: unknown): boolean {
 
 /** Nurse/doctor reschedule popup: only when we have a numeric DB id and an active duplicate to reschedule. */
 function canShowCalendarRescheduleDuplicateModal(role: unknown, record: any | null): boolean {
-  if (!isDoctorLike(role as string)) return false;
+  const r = String(role ?? "");
+  if (!isDoctorLike(r) && r !== "patient") return false;
   if (!record) return false;
   if (!Number.isFinite(Number(record.id))) return false;
   return isServiceDuplicateBlockingStatusCal(record.status ?? record.dup_status);
+}
+
+function findDuplicateServiceAppointmentAnyDateCal(
+  appointments: any[],
+  patientId: number,
+  providerIdStr: string,
+  selectedScheduledAt: string | null,
+  normType: "treatment" | "consultation",
+  treatmentId: number | null,
+  consultationId: number | null,
+): any | null {
+  if (!appointments?.length) return null;
+  if (normType === "treatment" && (treatmentId == null || Number.isNaN(Number(treatmentId)))) return null;
+  if (normType === "consultation" && (consultationId == null || Number.isNaN(Number(consultationId)))) return null;
+
+  const selectedKey = selectedScheduledAt
+    ? (() => {
+        const d = parseScheduledAtAsLocalCalendar(selectedScheduledAt);
+        if (Number.isNaN(d.getTime())) return null;
+        return format(d, "yyyy-MM-dd'T'HH:mm:ss");
+      })()
+    : null;
+
+  return (
+    appointments.find((apt: any) => {
+      if (!isServiceDuplicateBlockingStatusCal(apt.status)) return false;
+      const aptPatientId = apt.patient_id ?? apt.patientId;
+      const aptProviderId = apt.provider_id ?? apt.providerId;
+      if (Number(aptPatientId) !== Number(patientId)) return false;
+      if (String(aptProviderId) !== String(providerIdStr)) return false;
+
+      // Different datetime (reschedule flow); ignore exact same start.
+      if (selectedKey) {
+        const aptStart = parseScheduledAtAsLocalCalendar(apt.scheduledAt);
+        if (!Number.isNaN(aptStart.getTime())) {
+          const aptKey = format(aptStart, "yyyy-MM-dd'T'HH:mm:ss");
+          if (aptKey === selectedKey) return false;
+        }
+      }
+
+      const aptKind = String(apt.appointmentType || apt.appointment_type || "").toLowerCase();
+      const aptTid = apt.treatmentId ?? apt.treatment_id;
+      const aptCid = apt.consultationId ?? apt.consultation_id;
+      if (normType === "treatment") {
+        return aptKind === "treatment" && Number(aptTid) === Number(treatmentId);
+      }
+      return aptKind === "consultation" && Number(aptCid) === Number(consultationId);
+    }) ?? null
+  );
 }
 
 function formatAppointmentStatusLabelCal(status: unknown): string {
@@ -5787,10 +5837,8 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                         console.log('[DUPLICATE CHECK] allAppointments:', allAppointments);
                         
                         if (allAppointments && selectedDate && numericPatientId) {
-                          // NOTE: We intentionally do NOT block on duplicate here (Book Appointment).
-                          // Per UX requirement, we only check duplicates on "Confirm Booking".
                           const selectedDateStr = format(selectedDate, 'yyyy-MM-dd');
-                          console.log('[DUPLICATE CHECK] selectedDateStr (confirm-time only):', selectedDateStr);
+                          console.log('[DUPLICATE CHECK] selectedDateStr:', selectedDateStr);
 
                           // Same patient: interval overlap with any provider (scheduled/confirmed only)
                           if (selectedTimeSlot) {
@@ -5817,6 +5865,78 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                                 return;
                                 }
                               }
+                            }
+                          }
+
+                          // Patient flow: if same patient + provider + same service exists on ANY other datetime,
+                          // show reschedule popup and do NOT open invoice modal.
+                          if (user?.role === "patient" && selectedProviderId) {
+                            const dupKind: "treatment" | "consultation" =
+                              normalizedPatientAppointmentType === "treatment" ? "treatment" : "consultation";
+                            const selectedScheduledAt = patientAppointmentData?.scheduledAt ?? null;
+                            const dupApt = findDuplicateServiceAppointmentAnyDateCal(
+                              allAppointments,
+                              Number(numericPatientId),
+                              String(selectedProviderId),
+                              selectedScheduledAt,
+                              dupKind,
+                              patientTreatmentId,
+                              patientConsultationId,
+                            );
+
+                            if (dupApt) {
+                              const normalizedDupBook = {
+                                ...dupApt,
+                                id: Number((dupApt as any).id),
+                                status: (dupApt as any)?.status ?? (dupApt as any)?.dup_status,
+                                scheduledAt: (dupApt as any)?.scheduledAt ?? (dupApt as any)?.scheduled_at,
+                              };
+
+                              // Close booking, open reschedule
+                              setShowNewAppointmentModal(false);
+                              setShowInvoiceModal(false);
+                              setShowInvoiceSummary(false);
+
+                              // Keep the new appointment payload so we can create it after rescheduling.
+                              setPendingAppointmentData({
+                                ...patientAppointmentData,
+                                status: "scheduled",
+                                rescheduledFromId: Number((dupApt as any).id),
+                              });
+
+                              const prov = usersData?.find((u: any) => String(u.id) === String(selectedProviderId));
+                              const doctorName = prov
+                                ? `${prov.firstName ?? ""} ${prov.lastName ?? ""}`.trim()
+                                : "the selected provider";
+                              const patientName = patientForDuplicateCheck
+                                ? `${patientForDuplicateCheck.firstName ?? ""} ${patientForDuplicateCheck.lastName ?? ""}`.trim() || "the patient"
+                                : "the patient";
+                              const tid = dupApt.treatmentId ?? dupApt.treatment_id;
+                              const cid = dupApt.consultationId ?? dupApt.consultation_id;
+                              const serviceLabel =
+                                dupKind === "treatment"
+                                  ? doctorAppointmentSelectedTreatment?.name ||
+                                    (treatmentsList as any[]).find((t: any) => Number(t.id) === Number(tid))?.name ||
+                                    "this treatment"
+                                  : doctorAppointmentSelectedConsultation?.serviceName ||
+                                    (consultationServices as any[]).find((s: any) => Number(s.id) === Number(cid))?.serviceName ||
+                                    "this consultation";
+
+                              setDuplicateAppointmentDetails(
+                                buildCalendarDuplicateServiceWarningMessage(
+                                  dupKind,
+                                  dupApt,
+                                  patientName,
+                                  doctorName,
+                                  serviceLabel,
+                                ),
+                              );
+                              setDuplicateAppointmentRecord(normalizedDupBook);
+                              setPendingDuplicateCreateMode("doctor");
+                              setDuplicateResolveStatus("rescheduled");
+                              setShowDuplicateWarning(true);
+                              setShowConfirmationModal(false);
+                              return;
                             }
                           }
                         } else {

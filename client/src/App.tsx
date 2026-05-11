@@ -87,6 +87,7 @@ import CreateTrialSetPasswordPage from "@/pages/create-trial-set-password";
 
 // Public pages (no login required)
 import PublicBookAppointmentPage from "@/pages/book-appointment";
+import PublicPatientRegisterPage from "@/pages/patient-register";
 
 // Legal Pages
 import PrivacyPolicy from "@/pages/legal/PrivacyPolicy";
@@ -533,6 +534,7 @@ function AppRouter() {
       /^\/[^/]+\/book-appointment(?:[/?#]|$)/.test(location) ||
       /^\/[^/]+\/book(?:[/?#]|$)/.test(location) ||
       /^\/[^/]+\/appointments\/book(?:[/?#]|$)/.test(location);
+    const isPublicSelfRegistrationRoute = /^\/[^/]+\/register(?:[/?#]|$)/.test(location);
 
     const isSharedFormRoute = location.includes("/forms/fill");
     const isLandingPage =
@@ -568,7 +570,8 @@ function AppRouter() {
       !location.includes("/auth/login") &&
       !location.includes("/auth/reset-password") &&
       !location.startsWith("/create-trial") &&
-      !isPublicBookingRoute
+      !isPublicBookingRoute &&
+      !isPublicSelfRegistrationRoute
     ) {
       // Check if we're on a subdomain route (e.g., /maryamkhan/dashboard)
       if (isSubdomainRoute) {
@@ -613,6 +616,7 @@ function AppRouter() {
         <Route path="/:subdomain/book-appointment" component={PublicBookAppointmentPage} />
         <Route path="/:subdomain/book" component={PublicBookAppointmentPage} />
         <Route path="/:subdomain/appointments/book" component={PublicBookAppointmentPage} />
+        <Route path="/:subdomain/register" component={PublicPatientRegisterPage} />
         <Route path="/" component={LandingPage} />
         <Route path="/landing" component={LandingPage} />
         <Route path="/landing/about" component={AboutPage} />

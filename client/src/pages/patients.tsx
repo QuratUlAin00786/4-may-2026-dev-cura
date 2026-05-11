@@ -15,6 +15,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
 import { useRolePermissions } from "@/hooks/use-role-permissions";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   Tooltip,
   TooltipContent,
@@ -69,6 +70,7 @@ export default function Patients() {
   // State for patient data
   const [patient, setPatient] = useState<any>(null);
   const [patientLoading, setPatientLoading] = useState(false);
+  const [linkedUserProfilePicturePath, setLinkedUserProfilePicturePath] = useState<string | null>(null);
   const [anatomicalFiles, setAnatomicalFiles] = useState<
     Array<{ filename: string; url: string; uploadedAt: string; size: number }>
   >([]);
@@ -128,6 +130,68 @@ export default function Patients() {
 
     fetchPatient();
   }, [patientId]);
+
+  // When viewing records, if this patient is linked to a user, load their profile picture from users table.
+  useEffect(() => {
+    const fetchLinkedUserProfilePicture = async () => {
+      // Best: backend already returns it for this patient (avoids extra lookups/permissions)
+      if (patient?.linkedUserProfilePicturePath) {
+        setLinkedUserProfilePicturePath(patient.linkedUserProfilePicturePath);
+        return;
+      }
+
+      const linkedUserId =
+        patient?.userId ??
+        patient?.user_id ??
+        patient?.linkedUserId ??
+        patient?.linked_user_id ??
+        patient?.user?.id ??
+        patient?.user?.userId;
+
+      try {
+        // Best: fetch the specific linked user (works for receptionist too).
+        if (linkedUserId != null) {
+          const basicRes = await apiRequest("GET", `/api/users/${encodeURIComponent(String(linkedUserId))}/basic`);
+          const basic = await basicRes.json().catch(() => ({}));
+          if (basicRes.ok) {
+            setLinkedUserProfilePicturePath(basic?.profilePicturePath || null);
+            return;
+          }
+        }
+
+        // Fallback: Try users list (admin/doctor/nurse). If blocked, fallback to telemedicine users.
+        let users: any[] | null = null;
+        try {
+          const response = await apiRequest("GET", "/api/users");
+          const data = await response.json();
+          users = Array.isArray(data) ? data : null;
+        } catch {
+          users = null;
+        }
+
+        if (!users) {
+          const tmRes = await apiRequest("GET", "/api/telemedicine/users");
+          const tmData = await tmRes.json();
+          users = Array.isArray(tmData) ? tmData : null;
+        }
+
+        const patientEmail = String(patient?.email || "").trim().toLowerCase();
+        const u = users
+          ? users.find((x: any) => {
+              if (linkedUserId != null) return String(x.id) === String(linkedUserId);
+              if (patientEmail) return String(x.email || "").trim().toLowerCase() === patientEmail;
+              return false;
+            })
+          : null;
+
+        setLinkedUserProfilePicturePath(u?.profilePicturePath || u?.profile_picture_path || null);
+      } catch (e) {
+        setLinkedUserProfilePicturePath(null);
+      }
+    };
+
+    fetchLinkedUserProfilePicture();
+  }, [patient]);
 
   useEffect(() => {
     if (patient) {
@@ -329,6 +393,15 @@ export default function Patients() {
                 <ArrowLeft className="h-4 w-4" />
                 Back to Patients
               </Button>
+              <Avatar className="h-10 w-10 flex-shrink-0">
+                {linkedUserProfilePicturePath ? (
+                  <AvatarImage src={linkedUserProfilePicturePath} alt="User profile picture" />
+                ) : null}
+                <AvatarFallback>
+                  {String(patient.firstName || "P").charAt(0).toUpperCase()}
+                  {String(patient.lastName || "").charAt(0).toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
               <div>
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
                   {patient.firstName} {patient.lastName} - Medical Records

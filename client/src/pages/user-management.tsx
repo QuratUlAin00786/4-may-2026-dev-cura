@@ -54,14 +54,15 @@ import {
 import { Resolver, SubmitHandler, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { Plus, Edit, Trash2, UserPlus, Shield, Stethoscope, Users, Calendar, User, TestTube, Lock, BookOpen, X, Check, LayoutGrid, LayoutList, Eye, EyeOff, ChevronsUpDown } from "lucide-react";
+import { Plus, Edit, Trash2, UserPlus, Shield, Stethoscope, Users, Calendar, User, TestTube, Lock, BookOpen, X, Check, LayoutGrid, LayoutList, Eye, EyeOff, ChevronsUpDown, Mail } from "lucide-react";
 import { Link, useLocation } from "wouter";
 import { toast } from "@/hooks/use-toast";
-import { apiRequest, getTenantSubdomain, queryClient } from "@/lib/queryClient";
+import { apiRequest, buildUrl, getTenantSubdomain, queryClient } from "@/lib/queryClient";
 import { Header } from "@/components/layout/header";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
 import { isDoctorLike } from "@/lib/role-utils";
 import { useAuth } from "@/hooks/use-auth";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 
 // Date formatting helper to match subscription.tsx format (UTC-based)
 const parseDateParts = (value?: string | Date | null) => {
@@ -1253,6 +1254,10 @@ function SearchableSelect({
   );
 }
 
+/** Success modal title when a patient self-registration link is emailed */
+const REGISTRATION_LINK_EMAIL_SUCCESS_TITLE =
+  "Registration link created and shared successfully by email";
+
 export default function UserManagement() {
   const [, setLocation] = useLocation();
   const { user, loading: authLoading } = useAuth();
@@ -1260,12 +1265,22 @@ export default function UserManagement() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
   const [successTitle, setSuccessTitle] = useState("");
+  const [isUserProfileImagePreviewOpen, setIsUserProfileImagePreviewOpen] = useState(false);
+  const [userProfileImagePreviewUrl, setUserProfileImagePreviewUrl] = useState<string | null>(null);
   const getInitialPermissions = () => ({
     modules: getDefaultModulePermissions(),
     fields: getDefaultFieldPermissions(),
   });
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
+
+  // Patient self-registration invite (staff)
+  const [showSelfRegistrationDialog, setShowSelfRegistrationDialog] = useState(false);
+  const [selfRegistrationEmail, setSelfRegistrationEmail] = useState("");
+  const [selfRegistrationEmailError, setSelfRegistrationEmailError] = useState<string>("");
+  const [selfRegistrationPortalAccess, setSelfRegistrationPortalAccess] = useState(true);
+  const [selfRegistrationLink, setSelfRegistrationLink] = useState<string>("");
+  const [isSendingSelfRegistrationLink, setIsSendingSelfRegistrationLink] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [departmentOpen, setDepartmentOpen] = useState(false);
   const [roleOpen, setRoleOpen] = useState(false);
@@ -1329,7 +1344,7 @@ export default function UserManagement() {
   };
 
   // Fetch subscription limit on page load so Add New User doesn't trigger a fetch (only Edit User loads existing data)
-  const { data: subscriptionLimitData, isLoading: isLoadingSubscriptionLimit } = useQuery({
+  const { data: subscriptionLimitData, isLoading: isLoadingSubscriptionLimit, refetch: refetchSubscriptionLimit } = useQuery({
     queryKey: ["/api/users/check-subscription-limit"],
     queryFn: fetchSubscriptionLimit,
     enabled: true,
@@ -1714,9 +1729,17 @@ export default function UserManagement() {
     };
     
     try {
-      // UK-specific lookup using Postcodes.io
+      // UK-specific lookup (proxy via our backend to satisfy CSP)
       if (selectedCountry === 'United Kingdom') {
-        const ukResponse = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(postcode.trim())}`);
+        const tenant = getTenantSubdomain();
+        const ukResponse = await fetch(
+          buildUrl(`/api/public/${encodeURIComponent(tenant)}/postcode-lookup?postcode=${encodeURIComponent(postcode.trim())}`),
+          {
+            method: "GET",
+            headers: { "X-Tenant-Subdomain": tenant },
+            credentials: "include",
+          },
+        );
         
         if (ukResponse.ok) {
           const ukData = await ukResponse.json();
@@ -1996,6 +2019,105 @@ export default function UserManagement() {
     }
   };
 
+  const handleSendSelfRegistrationLink = async () => {
+    const email = String(selfRegistrationEmail || "").trim();
+    if (!email) {
+      setSelfRegistrationEmailError("Patient email is required.");
+      toast({ title: "Email is required", variant: "destructive" });
+      return;
+    }
+
+    const parseThrownApiError = (message: string) => {
+      // apiRequest throws errors like: "409: {\"error\":\"...\",\"code\":\"...\"}"
+      const m = String(message || "");
+      const match = m.match(/^\s*(\d{3})\s*:\s*(.*)\s*$/);
+      if (!match) return null;
+      const status = Number(match[1]);
+      const tail = match[2] || "";
+      try {
+        const json = JSON.parse(tail);
+        return { status, json };
+      } catch {
+        return { status, json: null as any, tail };
+      }
+    };
+
+    try {
+      setIsSendingSelfRegistrationLink(true);
+      setSelfRegistrationLink("");
+      setSelfRegistrationEmailError("");
+
+      // Subscription limit check before sending invite
+      try {
+        const limitRes = await apiRequest("GET", "/api/users/check-subscription-limit");
+        const limitData = await limitRes.json().catch(() => ({}));
+        const remainingPatients = Number(limitData?.remainingPatients);
+        const remainingUsers = Number(limitData?.remainingUsers);
+        if (!Number.isFinite(remainingPatients) || remainingPatients <= 0) {
+          toast({ title: "Patient limit access", variant: "destructive" });
+          setIsSendingSelfRegistrationLink(false);
+          return;
+        }
+        if (!Number.isFinite(remainingUsers) || remainingUsers <= 0) {
+          toast({ title: "User limit access", variant: "destructive" });
+          setIsSendingSelfRegistrationLink(false);
+          return;
+        }
+      } catch (limitErr: any) {
+        // If limit check fails, fail closed to prevent over-allocating
+        toast({
+          title: "Patient limit access",
+          description: limitErr?.message || "Unable to verify patient limit. Please try again.",
+          variant: "destructive",
+        });
+        setIsSendingSelfRegistrationLink(false);
+        return;
+      }
+
+      const res = await apiRequest("POST", "/api/patients/share-self-registration-link", {
+        email,
+        portalAccess: !!selfRegistrationPortalAccess,
+      });
+      const data = await res.json().catch(() => ({}));
+      setSelfRegistrationLink(String(data?.link || ""));
+      setSelfRegistrationEmailError("");
+      // Show success in the existing green-tick modal, then close the dialog.
+      setShowSelfRegistrationDialog(false);
+      setSuccessTitle(REGISTRATION_LINK_EMAIL_SUCCESS_TITLE);
+      setSuccessMessage(String(email).trim());
+      setShowSuccessModal(true);
+    } catch (e: any) {
+      const parsed = parseThrownApiError(e?.message || "");
+      const json = parsed?.json;
+      if (json?.code === "EMAIL_ALREADY_EXISTS" && json?.existingUser) {
+        const existingName = String(json.existingUser?.name || "").trim();
+        const existingRole = String(json.existingUser?.role || "").trim();
+        const extra = [existingName, existingRole].filter(Boolean).join(" — ");
+        setSelfRegistrationEmailError(
+          `This email already exists. ${extra ? `(${extra})` : ""} Please try another email.`,
+        );
+        return; // no toast for this case
+      }
+      if (json?.code === "EMAIL_IN_OTHER_ORG") {
+        const existingName = String(json.existingUser?.name || "").trim();
+        const existingRole = String(json.existingUser?.role || "").trim();
+        const userExtra = [existingName, existingRole].filter(Boolean).join(" — ");
+        const orgName = String(json.organization?.name || "").trim();
+        const orgExtra = orgName ? `Organization: ${orgName}` : "";
+        setSelfRegistrationEmailError(
+          `This email is associated with another organization.${userExtra ? ` (${userExtra})` : ""}${orgExtra ? ` ${orgExtra}.` : ""}`,
+        );
+        return; // no toast for this case
+      }
+
+      const fallbackMsg = json?.error ? String(json.error) : e?.message || "Failed to send link";
+      setSelfRegistrationEmailError(fallbackMsg);
+      toast({ title: "Failed to send link", description: fallbackMsg, variant: "destructive" });
+    } finally {
+      setIsSendingSelfRegistrationLink(false);
+    }
+  };
+
   const currentCountry = form.watch("address.country");
   const currentPostcodeValue = form.watch("address.postcode");
 
@@ -2019,7 +2141,15 @@ export default function UserManagement() {
     const cleanedPostcode = selection.split(",").pop()?.trim() || form.getValues("address.postcode") || "";
     setLookupLoading(true);
     try {
-      const response = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(cleanedPostcode)}`);
+      const tenant = getTenantSubdomain();
+      const response = await fetch(
+        buildUrl(`/api/public/${encodeURIComponent(tenant)}/postcode-lookup?postcode=${encodeURIComponent(cleanedPostcode)}`),
+        {
+          method: "GET",
+          headers: { "X-Tenant-Subdomain": tenant },
+          credentials: "include",
+        },
+      );
       if (!response.ok) {
         throw new Error("Unable to fetch address details");
       }
@@ -2097,7 +2227,15 @@ export default function UserManagement() {
 
     try {
       const cleanedPostcode = candidatePostcode.replace(/\s+/g, "");
-      const response = await fetch(`https://api.postcodes.io/postcodes/${cleanedPostcode}/autocomplete`);
+      const tenant = getTenantSubdomain();
+      const response = await fetch(
+        buildUrl(`/api/public/${encodeURIComponent(tenant)}/postcode-autocomplete?postcode=${encodeURIComponent(cleanedPostcode)}`),
+        {
+          method: "GET",
+          headers: { "X-Tenant-Subdomain": tenant },
+          credentials: "include",
+        },
+      );
       if (!response.ok) {
         throw new Error("No addresses found");
       }
@@ -3293,6 +3431,71 @@ export default function UserManagement() {
     deleteUserMutation.mutate(userId);
   };
 
+  const getUserProfileImageUrl = (u: any): string | null => {
+    return (u?.profilePicturePath as string | null | undefined) || (u?.profile_picture_path as string | null | undefined) || null;
+  };
+
+  const handleAdminUploadUserProfileImage = async (targetUserId: number, file: File) => {
+    const okType =
+      file.type === "image/jpeg" ||
+      file.type === "image/png" ||
+      file.type === "image/webp";
+    if (!okType) {
+      toast({ title: "Invalid file type", description: "Only JPG, JPEG, PNG, and WebP are allowed.", variant: "destructive" });
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast({ title: "File too large", description: "Max file size is 2MB.", variant: "destructive" });
+      return;
+    }
+
+    try {
+      const headers: Record<string, string> = { "X-Tenant-Subdomain": getTenantSubdomain() };
+      const token = localStorage.getItem("auth_token");
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const formData = new FormData();
+      formData.append("image", file);
+      const res = await fetch(`/api/users/${encodeURIComponent(String(targetUserId))}/profile-picture`, {
+        method: "POST",
+        headers,
+        body: formData,
+        credentials: "same-origin",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || `Upload failed (HTTP ${res.status})`);
+
+      // Update edit modal preview immediately if we are editing this user
+      if (editingUser && editingUser.id === targetUserId && data?.profilePicturePath) {
+        setEditingUser({ ...(editingUser as any), profilePicturePath: data.profilePicturePath });
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["/api/users"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/telemedicine/users"] });
+      toast({ title: "Profile picture updated" });
+    } catch (e: any) {
+      toast({ title: "Upload failed", description: e?.message || "Could not upload profile picture.", variant: "destructive" });
+    }
+  };
+
+  const handleAdminDeleteUserProfileImage = async (targetUserId: number) => {
+    try {
+      const res = await apiRequest("DELETE", `/api/users/${targetUserId}/profile-picture`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || `Delete failed (HTTP ${res.status})`);
+
+      if (editingUser && editingUser.id === targetUserId) {
+        setEditingUser({ ...(editingUser as any), profilePicturePath: null });
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["/api/users"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/telemedicine/users"] });
+      toast({ title: "Profile picture removed" });
+    } catch (e: any) {
+      toast({ title: "Delete failed", description: e?.message || "Could not remove profile picture.", variant: "destructive" });
+    }
+  };
+
   const getRoleIcon = (role: string) => {
     switch (role) {
       case "admin":
@@ -3422,6 +3625,29 @@ export default function UserManagement() {
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 page-full-width page-zoom-90">
       <Header title="User Management" subtitle="Manage system users and their permissions" />
+
+      <Dialog
+        open={isUserProfileImagePreviewOpen}
+        onOpenChange={(open) => {
+          setIsUserProfileImagePreviewOpen(open);
+          if (!open) setUserProfileImagePreviewUrl(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Profile picture</DialogTitle>
+          </DialogHeader>
+          <div className="w-full">
+            {userProfileImagePreviewUrl ? (
+              <img
+                src={userProfileImagePreviewUrl}
+                alt="Profile picture preview"
+                className="w-full max-h-[70vh] object-contain rounded-md border"
+              />
+            ) : null}
+          </div>
+        </DialogContent>
+      </Dialog>
       
       <div className="w-full px-4 sm:px-5 lg:px-6 py-5">
         {/* Summary Cards */}
@@ -3565,6 +3791,22 @@ export default function UserManagement() {
               </Button>
             </div>
             
+            <Button
+              onClick={() => {
+                setSelfRegistrationEmail("");
+                setSelfRegistrationEmailError("");
+                setSelfRegistrationPortalAccess(true);
+                setSelfRegistrationLink("");
+                setShowSelfRegistrationDialog(true);
+              }}
+              variant="outline"
+              className="flex items-center gap-2"
+              data-testid="button-send-self-registration-link"
+            >
+              <Mail className="h-4 w-4" />
+              Send Registration Link
+            </Button>
+            
               <Button 
                 onClick={() => {
                   resetCreateUserFormState();
@@ -3587,6 +3829,225 @@ export default function UserManagement() {
           </div>
         </div>
           
+          <Dialog
+            open={showSelfRegistrationDialog}
+            onOpenChange={(open) => {
+              setShowSelfRegistrationDialog(open);
+              if (open) {
+                // Refresh counts so we don't send invites when patient slots are exhausted
+                void refetchSubscriptionLimit();
+              }
+            }}
+          >
+            <DialogContent className="sm:max-w-[560px]">
+              <DialogHeader>
+                <DialogTitle>Send patient self-registration link</DialogTitle>
+                <DialogDescription>
+                  This emails a one-time link so the patient can submit their details. You can choose whether they should also get portal login access.
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="space-y-4">
+                {/* Subscription / patient limit info */}
+                <div className="p-4 rounded-lg bg-yellow-50 dark:bg-yellow-950 border border-yellow-200 dark:border-yellow-800">
+                  {isLoadingSubscriptionLimit ? (
+                    <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+                      <div className="animate-spin h-4 w-4 border-2 border-yellow-600 border-t-transparent rounded-full" />
+                      Loading subscription details...
+                    </div>
+                  ) : subscriptionLimitData ? (
+                    <div className="space-y-3">
+                      <h4 className="text-sm font-semibold text-yellow-900 dark:text-yellow-100">Subscription Status</h4>
+
+                      {(subscriptionLimitData.planName || subscriptionLimitData.expiresAt) && (
+                        <div className="pb-2 border-b border-yellow-200 dark:border-yellow-800">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                            {subscriptionLimitData.planName && (
+                              <div>
+                                <span className="text-gray-600 dark:text-gray-400">Subscription Plan:</span>
+                                <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                                  {subscriptionLimitData.planName}
+                                </span>
+                              </div>
+                            )}
+                            {subscriptionLimitData.expiresAt && (
+                              <div>
+                                <span className="text-gray-600 dark:text-gray-400">Expires At:</span>
+                                <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                                  {formatDateTime(subscriptionLimitData.expiresAt)}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <div>
+                        <h5 className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">User Limits</h5>
+                        <div className="grid grid-cols-3 gap-4 text-sm">
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Maximum Users:</span>
+                            <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                              {subscriptionLimitData.maxUsers}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Current Users:</span>
+                            <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                              {subscriptionLimitData.currentUserCount}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Remaining Slots:</span>
+                            <span
+                              className={`ml-2 font-semibold ${
+                                subscriptionLimitData.remainingUsers > 0
+                                  ? "text-green-600 dark:text-green-400"
+                                  : "text-red-600 dark:text-red-400"
+                              }`}
+                            >
+                              {subscriptionLimitData.remainingUsers}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="pt-2 border-t border-yellow-200 dark:border-yellow-800">
+                        <h5 className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">Patient Limits</h5>
+                        <div className="grid grid-cols-3 gap-4 text-sm">
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Maximum Patients:</span>
+                            <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                              {subscriptionLimitData.maxPatients}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Current Patients:</span>
+                            <span className="ml-2 font-semibold text-yellow-900 dark:text-yellow-100">
+                              {subscriptionLimitData.currentPatientCount}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-gray-600 dark:text-gray-400">Remaining Slots:</span>
+                            <span
+                              className={`ml-2 font-semibold ${
+                                subscriptionLimitData.remainingPatients > 0
+                                  ? "text-green-600 dark:text-green-400"
+                                  : "text-red-600 dark:text-red-400"
+                              }`}
+                            >
+                              {subscriptionLimitData.remainingPatients}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {subscriptionLimitData.remainingUsers <= 0 && (
+                        <div className="p-3 bg-red-100 dark:bg-red-900 border border-red-300 dark:border-red-700 rounded-md">
+                          <p className="text-sm font-medium text-red-900 dark:text-red-100">
+                            User limit access. Please upgrade your subscription to add more users.
+                          </p>
+                        </div>
+                      )}
+
+                      {subscriptionLimitData.remainingPatients <= 0 && (
+                        <div className="p-3 bg-red-100 dark:bg-red-900 border border-red-300 dark:border-red-700 rounded-md">
+                          <p className="text-sm font-medium text-red-900 dark:text-red-100">
+                            Patient limit access. Please upgrade your subscription to add more patients.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-red-700 dark:text-red-300">
+                      Patient limit access. No active subscription found or unable to load limits.
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="selfRegEmail">Patient email</Label>
+                  <Input
+                    id="selfRegEmail"
+                    value={selfRegistrationEmail}
+                    onChange={(e) => {
+                      setSelfRegistrationEmail(e.target.value);
+                      if (selfRegistrationEmailError) setSelfRegistrationEmailError("");
+                    }}
+                    placeholder="patient@email.com"
+                  />
+                  {!!selfRegistrationEmailError && (
+                    <div className="text-xs text-red-600">{selfRegistrationEmailError}</div>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Portal access</Label>
+                  <Select
+                    value={selfRegistrationPortalAccess ? "enabled" : "disabled"}
+                    onValueChange={(v) => setSelfRegistrationPortalAccess(v === "enabled")}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="enabled">Enabled (creates a login user)</SelectItem>
+                      <SelectItem value="disabled">Disabled (patient record only)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {!!selfRegistrationLink && (
+                  <div className="rounded-md border bg-gray-50 dark:bg-gray-900/30 p-3">
+                    <div className="text-sm font-medium mb-1">Link</div>
+                    <div className="text-xs break-all text-gray-700 dark:text-gray-300">{selfRegistrationLink}</div>
+                    <div className="mt-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(selfRegistrationLink);
+                            toast({ title: "Copied" });
+                          } catch {
+                            toast({ title: "Copy failed", variant: "destructive" });
+                          }
+                        }}
+                      >
+                        Copy link
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setShowSelfRegistrationDialog(false)}
+                  disabled={isSendingSelfRegistrationLink}
+                >
+                  Close
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleSendSelfRegistrationLink}
+                  disabled={
+                    isSendingSelfRegistrationLink ||
+                    isLoadingSubscriptionLimit ||
+                    !subscriptionLimitData ||
+                    Number(subscriptionLimitData?.remainingPatients) <= 0 ||
+                    Number(subscriptionLimitData?.remainingUsers) <= 0
+                  }
+                >
+                  {isSendingSelfRegistrationLink ? "Sending..." : "Send link"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
           <Dialog open={isCreateModalOpen || !!editingUser} onOpenChange={(open) => {
               if (!open) {
                 setIsCreateModalOpen(false);
@@ -3723,6 +4184,82 @@ export default function UserManagement() {
               </DialogHeader>
               
               <form onSubmit={form.handleSubmit(onSubmit, onError)} className="space-y-4">
+                {user?.role === "admin" && editingUser ? (
+                  <div className="p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <button
+                          type="button"
+                          className="rounded-full"
+                          onClick={() => {
+                            const url = getUserProfileImageUrl(editingUser);
+                            if (url) {
+                              setUserProfileImagePreviewUrl(url);
+                              setIsUserProfileImagePreviewOpen(true);
+                            }
+                          }}
+                          disabled={!getUserProfileImageUrl(editingUser)}
+                          aria-label="Preview profile picture"
+                        >
+                          <Avatar className="w-12 h-12 flex-shrink-0">
+                            {getUserProfileImageUrl(editingUser) ? (
+                              <AvatarImage src={getUserProfileImageUrl(editingUser) as string} alt="Profile picture" />
+                            ) : null}
+                            <AvatarFallback className="bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
+                              {getRoleIcon(editingUser.role)}
+                            </AvatarFallback>
+                          </Avatar>
+                        </button>
+                        <div className="min-w-0">
+                          <div className="font-medium text-gray-900 dark:text-gray-100 truncate">
+                            {displayNameForUserRow(editingUser)}
+                          </div>
+                          <div className="text-sm text-gray-500 dark:text-gray-400 truncate">{editingUser.email}</div>
+                          <div className="text-xs text-gray-400 mt-1">Admin can update this user’s profile picture.</div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 justify-end">
+                        <input
+                          id="admin-user-profile-upload"
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          className="hidden"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f && editingUser?.id) handleAdminUploadUserProfileImage(editingUser.id, f);
+                            e.currentTarget.value = "";
+                          }}
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            const el = document.getElementById("admin-user-profile-upload") as HTMLInputElement | null;
+                            el?.click();
+                          }}
+                          data-testid="button-admin-upload-user-profile-picture"
+                        >
+                          Upload / Change
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="destructive"
+                          size="sm"
+                          disabled={!getUserProfileImageUrl(editingUser)}
+                          onClick={() => {
+                            if (editingUser?.id) handleAdminDeleteUserProfileImage(editingUser.id);
+                          }}
+                          data-testid="button-admin-delete-user-profile-picture"
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="firstName">First Name</Label>
@@ -5347,9 +5884,29 @@ export default function UserManagement() {
                           data-testid={`user-card-${user.id}`}
                         >
                           <div className="flex items-center space-x-4 min-w-0 flex-1">
-                            <div className="w-10 h-10 bg-blue-100 dark:bg-blue-900 rounded-full flex items-center justify-center flex-shrink-0">
-                              {getRoleIcon(user.role)}
-                            </div>
+                            <button
+                              type="button"
+                              className="rounded-full"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const url = getUserProfileImageUrl(user);
+                                if (url) {
+                                  setUserProfileImagePreviewUrl(url);
+                                  setIsUserProfileImagePreviewOpen(true);
+                                }
+                              }}
+                              disabled={!getUserProfileImageUrl(user)}
+                              aria-label="Preview profile picture"
+                            >
+                              <Avatar className="w-10 h-10 flex-shrink-0">
+                                {getUserProfileImageUrl(user) ? (
+                                  <AvatarImage src={getUserProfileImageUrl(user) as string} alt="Profile picture" />
+                                ) : null}
+                                <AvatarFallback className="bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
+                                  {getRoleIcon(user.role)}
+                                </AvatarFallback>
+                              </Avatar>
+                            </button>
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-2 min-w-0">
                                 <h3
@@ -5740,9 +6297,29 @@ export default function UserManagement() {
                     <CardContent className="p-4">
                       <div className="flex items-start justify-between mb-3">
                         <div className="flex items-center space-x-3">
-                          <div className="w-12 h-12 bg-blue-100 dark:bg-blue-900 rounded-full flex items-center justify-center">
-                            {getRoleIcon(user.role)}
-                          </div>
+                          <button
+                            type="button"
+                            className="rounded-full"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const url = getUserProfileImageUrl(user);
+                              if (url) {
+                                setUserProfileImagePreviewUrl(url);
+                                setIsUserProfileImagePreviewOpen(true);
+                              }
+                            }}
+                            disabled={!getUserProfileImageUrl(user)}
+                            aria-label="Preview profile picture"
+                          >
+                            <Avatar className="w-12 h-12 flex-shrink-0">
+                              {getUserProfileImageUrl(user) ? (
+                                <AvatarImage src={getUserProfileImageUrl(user) as string} alt="Profile picture" />
+                              ) : null}
+                              <AvatarFallback className="bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
+                                {getRoleIcon(user.role)}
+                              </AvatarFallback>
+                            </Avatar>
+                          </button>
                           <div>
                             <div className="flex items-center gap-2 min-w-0">
                               <h3 className="font-medium text-gray-900 dark:text-gray-100 truncate">
@@ -6621,6 +7198,19 @@ export default function UserManagement() {
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
                   All related data has been permanently removed from the system
                 </p>
+              )}
+              {successTitle === REGISTRATION_LINK_EMAIL_SUCCESS_TITLE && (
+                <div className="mt-3 space-y-2 text-center">
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    The registration link was shared successfully by email.
+                  </p>
+                  {!!successMessage && (
+                    <p className="text-sm text-gray-900 dark:text-gray-100">
+                      <span className="text-gray-500 dark:text-gray-400">Email: </span>
+                      <span className="font-medium break-all">{successMessage}</span>
+                    </p>
+                  )}
+                </div>
               )}
             </DialogHeader>
             

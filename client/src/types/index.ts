@@ -197,6 +197,7 @@ export interface AuthUser {
   role: string;
   department?: string;
   gender?: string;
+  profilePicturePath?: string | null;
 }
 
 export interface TenantInfo {

@@ -105,6 +105,24 @@ function getPatientInitials(firstName: string, lastName: string): string {
   return `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
 }
 
+function getPatientAccountKindBadge(patient: any) {
+  const hasLoginUser =
+    patient?.userId != null ||
+    patient?.user_id != null ||
+    patient?.linkedUserId != null ||
+    patient?.linked_user_id != null;
+
+  return {
+    label: hasLoginUser ? "User + Patient" : "Patient only",
+    description: hasLoginUser
+      ? "This patient has a portal login user."
+      : "This is a patient record only (no portal login user).",
+    badgeClassName: hasLoginUser
+      ? "text-[10px] px-2 py-0.5 bg-white border-green-500 text-green-700 dark:bg-transparent dark:text-green-400 dark:border-green-700"
+      : "text-[10px] px-2 py-0.5 bg-white border-gray-300 text-gray-700 dark:bg-transparent dark:text-gray-300 dark:border-gray-600",
+  };
+}
+
 function calculateAge(dateOfBirth: string): number {
   if (!dateOfBirth) {
     console.warn("No dateOfBirth provided for age calculation");
@@ -3064,9 +3082,34 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                             ↳
                           </span>
                         )}
-                        <span className="truncate" title={`${patient.firstName} ${patient.lastName}`.trim()}>
-                          {patient.firstName} {patient.lastName}
-                        </span>
+                        {(() => {
+                          const meta = getPatientAccountKindBadge(patient);
+                          return (
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex items-center gap-2 min-w-0 group">
+                                    <span
+                                      className="truncate"
+                                      title={`${patient.firstName} ${patient.lastName}`.trim()}
+                                    >
+                                      {patient.firstName} {patient.lastName}
+                                    </span>
+                                    <Badge
+                                      variant="outline"
+                                      className={`${meta.badgeClassName} opacity-0 group-hover:opacity-100 transition-opacity`}
+                                    >
+                                      {meta.label}
+                                    </Badge>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p className="text-sm">{meta.description}</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          );
+                        })()}
                         {patient.medicalHistory?.allergies && patient.medicalHistory.allergies.length > 0 && (
                           <TooltipProvider>
                             <Tooltip>
@@ -3278,6 +3321,17 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                               </TooltipContent>
                             </Tooltip>
                           </TooltipProvider>
+                          {(() => {
+                            const meta = getPatientAccountKindBadge(patient);
+                            return (
+                              <Badge
+                                variant="outline"
+                                className={`${meta.badgeClassName} opacity-0 group-hover:opacity-100 transition-opacity`}
+                              >
+                                {meta.label}
+                              </Badge>
+                            );
+                          })()}
                           <TooltipProvider>
                             <div className="flex items-center gap-1 flex-shrink-0">
                               {patient.medicalHistory?.allergies &&

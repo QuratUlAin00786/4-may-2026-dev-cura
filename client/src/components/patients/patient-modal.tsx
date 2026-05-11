@@ -25,7 +25,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, buildUrl, getTenantSubdomain } from "@/lib/queryClient";
 import { useTenant } from "@/hooks/use-tenant";
 import { useToast } from "@/hooks/use-toast";
 import { Brain, Save, X } from "lucide-react";
@@ -714,7 +714,15 @@ export function PatientModal({ open, onOpenChange, editMode = false, editPatient
     const cleanedPostcode = selection.split(",").pop()?.trim() || form.getValues("address.postcode");
     setLookupLoading(true);
     try {
-      const response = await fetch(`https://api.postcodes.io/postcodes/${cleanedPostcode}`);
+      const tenant = getTenantSubdomain();
+      const response = await fetch(
+        buildUrl(`/api/public/${encodeURIComponent(tenant)}/postcode-lookup?postcode=${encodeURIComponent(cleanedPostcode)}`),
+        {
+          method: "GET",
+          headers: { "X-Tenant-Subdomain": tenant },
+          credentials: "include",
+        },
+      );
       if (!response.ok) {
         throw new Error("Unable to fetch address details");
       }
@@ -799,13 +807,21 @@ export function PatientModal({ open, onOpenChange, editMode = false, editPatient
 
     try {
       const cleanedPostcode = postcode.trim().replace(/\s+/g, "");
-      const response = await fetch(`https://api.postcodes.io/postcodes/${cleanedPostcode}/autocomplete`);
+      const tenant = getTenantSubdomain();
+      const response = await fetch(
+        buildUrl(`/api/public/${encodeURIComponent(tenant)}/postcode-autocomplete?postcode=${encodeURIComponent(cleanedPostcode)}`),
+        {
+          method: "GET",
+          headers: { "X-Tenant-Subdomain": tenant },
+          credentials: "include",
+        },
+      );
       if (!response.ok) {
         throw new Error("No addresses found");
       }
 
       const data = await response.json();
-      const results: string[] = data.result ?? [];
+      const results: string[] = Array.isArray(data.result) ? data.result : [];
       if (results.length === 0) {
         throw new Error("No addresses returned");
       }

@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { useLiveKitRoom } from "@/hooks/use-livekit-room";
 import { LiveKitControls } from "./livekit-controls";
 import { Card, CardContent } from "@/components/ui/card";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Phone, User, Users } from "lucide-react";
 import { RemoteParticipant, Track, RoomEvent } from "livekit-client";
 
@@ -10,6 +10,7 @@ interface LiveKitAudioCallProps {
   roomName: string;
   participantName: string;
   participantRole?: string;
+  participantImageUrl?: string | null;
   token?: string;
   serverUrl?: string;
   onDisconnect?: (disconnectedParticipant?: { name: string; role?: string }) => void;
@@ -21,6 +22,7 @@ export function LiveKitAudioCall({
   roomName,
   participantName,
   participantRole,
+  participantImageUrl,
   token,
   serverUrl,
   onDisconnect,
@@ -225,6 +227,9 @@ export function LiveKitAudioCall({
                   className="flex items-center gap-3 p-2 rounded-lg hover:bg-gray-100"
                 >
                   <Avatar>
+                    {participantImageUrl ? (
+                      <AvatarImage src={participantImageUrl} alt="Profile picture" />
+                    ) : null}
                     <AvatarFallback>
                       <User className="w-5 h-5" />
                     </AvatarFallback>

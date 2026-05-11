@@ -75,6 +75,47 @@ function requireOrgId(req: TenantRequest): number {
   return req.organizationId;
 }
 
+/** UTC calendar date at midnight for consistent DOB checks */
+function startOfTodayUtcDate(): Date {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+/** Parse YYYY-MM-DD as a UTC calendar date; invalid components return null */
+function parseIsoDateOnlyUTC(value: string): Date | null {
+  const s = String(value || "").trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  const dt = new Date(Date.UTC(y, mo, day));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo || dt.getUTCDate() !== day) return null;
+  return dt;
+}
+
+function ageYearsFromDobUTC(dob: Date): number {
+  const today = startOfTodayUtcDate();
+  let age = today.getUTCFullYear() - dob.getUTCFullYear();
+  const m = today.getUTCMonth() - dob.getUTCMonth();
+  if (m < 0 || (m === 0 && today.getUTCDate() < dob.getUTCDate())) age--;
+  return age;
+}
+
+/** Next P###### id from existing numeric patient_id values in the org */
+async function allocateNextDisplayPatientId(organizationId: number): Promise<string> {
+  const r = await pool.query<{ n: string | null }>(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(patient_id FROM 2) AS INTEGER)), 0)::text AS n
+     FROM patients
+     WHERE organization_id = $1 AND patient_id ~ '^P[0-9]+$'`,
+    [organizationId],
+  );
+  const raw = r.rows[0]?.n;
+  const max = raw ? parseInt(raw, 10) : 0;
+  const next = Number.isFinite(max) ? max + 1 : 1;
+  return `P${next.toString().padStart(6, "0")}`;
+}
+
 /**
  * Security helper: Enforces created_by field with logged-in user ID
  * Prevents client from spoofing creator identity
@@ -1471,6 +1512,7 @@ If you did not request this change, please contact ${clinicName}.`;
         subSpecialty: userDetails.subSpecialty,
         lastLoginAt: userDetails.lastLoginAt,
         professionalRegistrationId: (userDetails as any).professionalRegistrationId,
+        profilePicturePath: (userDetails as any).profilePicturePath ?? (userDetails as any).profile_picture_path ?? null,
       };
 
       console.log("[GET /api/users/current] Returning response with", Object.keys(response).length, "fields");
@@ -1485,6 +1527,307 @@ If you did not request this change, please contact ${clinicName}.`;
       });
     }
   });
+
+  // Upload / replace current user's profile picture
+  const uploadUserProfilePicture = multer({
+    storage: multer.diskStorage({
+      destination: async (req, _file, cb) => {
+        try {
+          const userId = req.user?.id;
+          const organizationId = req.user?.organizationId;
+          if (!userId || !organizationId) return cb(new Error("User not authenticated"), "");
+          const dir = path.join(
+            process.cwd(),
+            "uploads",
+            "profile_pictures",
+            String(organizationId),
+            "users",
+            String(userId),
+          );
+          await fs.promises.mkdir(dir, { recursive: true });
+          cb(null, dir);
+        } catch (e) {
+          cb(e as any, "");
+        }
+      },
+      filename: (_req, file, cb) => {
+        // Generate unique filename; never trust client filename
+        const mime = String(file.mimetype || "").toLowerCase();
+        const ext =
+          mime === "image/jpeg"
+            ? ".jpg"
+            : mime === "image/png"
+              ? ".png"
+              : mime === "image/webp"
+                ? ".webp"
+                : "";
+        const name = `${Date.now()}_${crypto.randomBytes(16).toString("hex")}${ext}`;
+        cb(null, name);
+      },
+    }),
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+    fileFilter: (_req, file, cb) => {
+      const mime = String(file.mimetype || "").toLowerCase();
+      const ok = mime === "image/jpeg" || mime === "image/png" || mime === "image/webp";
+      if (!ok) return cb(new Error("Invalid file type. Only JPG, JPEG, PNG, and WebP are allowed."));
+      cb(null, true);
+    },
+  });
+
+  app.post(
+    "/api/users/profile-picture",
+    authMiddleware,
+    uploadUserProfilePicture.single("image"),
+    async (req: TenantRequest, res) => {
+      try {
+        if (!req.user?.id || !req.user?.organizationId) {
+          return res.status(401).json({ error: "User not authenticated" });
+        }
+        const userId = Number(req.user.id);
+        const organizationId = Number(req.user.organizationId);
+        const file = (req as any).file as Express.Multer.File | undefined;
+        if (!file) return res.status(400).json({ error: "Image is required (field: image)" });
+
+        const relativeUrl = `/uploads/profile_pictures/${organizationId}/users/${userId}/${encodeURIComponent(
+          file.filename,
+        )}`;
+
+        // Delete old profile picture if present (best-effort)
+        try {
+          const oldRes = await pool.query<{ profile_picture_path: string | null }>(
+            `SELECT profile_picture_path FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+            [userId, organizationId],
+          );
+          const oldPath = oldRes.rows?.[0]?.profile_picture_path;
+          if (oldPath && String(oldPath).startsWith("/uploads/profile_pictures/")) {
+            const abs = path.join(process.cwd(), String(oldPath).replace(/^\/+/, ""));
+            await fs.promises.unlink(abs).catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
+
+        await pool.query(
+          `UPDATE users
+           SET profile_picture_path = $1
+           WHERE id = $2 AND organization_id = $3`,
+          [relativeUrl, userId, organizationId],
+        );
+
+        return res.json({
+          success: true,
+          profilePicturePath: relativeUrl,
+          url: relativeUrl,
+        });
+      } catch (error: any) {
+        const msg = String(error?.message || error || "Upload failed");
+        const isValidation =
+          /Invalid file type|File too large|LIMIT_FILE_SIZE/i.test(msg) ||
+          /Only JPG|JPEG|PNG|WebP/i.test(msg);
+        return res.status(isValidation ? 400 : 500).json({ error: msg });
+      }
+    },
+  );
+
+  // Delete current user's profile picture (removes file + clears DB path)
+  app.delete("/api/users/profile-picture", authMiddleware, async (req: TenantRequest, res) => {
+    try {
+      if (!req.user?.id || !req.user?.organizationId) {
+        return res.status(401).json({ error: "User not authenticated" });
+      }
+      const userId = Number(req.user.id);
+      const organizationId = Number(req.user.organizationId);
+
+      const oldRes = await pool.query<{ profile_picture_path: string | null }>(
+        `SELECT profile_picture_path FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+        [userId, organizationId],
+      );
+      const oldPath = oldRes.rows?.[0]?.profile_picture_path;
+
+      if (oldPath && String(oldPath).startsWith("/uploads/profile_pictures/")) {
+        const abs = path.join(process.cwd(), String(oldPath).replace(/^\/+/, ""));
+        await fs.promises.unlink(abs).catch(() => {});
+      }
+
+      await pool.query(
+        `UPDATE users
+         SET profile_picture_path = NULL
+         WHERE id = $1 AND organization_id = $2`,
+        [userId, organizationId],
+      );
+
+      return res.json({ success: true, profilePicturePath: null });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || "Failed to delete profile picture" });
+    }
+  });
+
+  // Basic user info (incl. profile picture) for in-app previews
+  // Used for showing linked user's avatar in patient records.
+  app.get("/api/users/:id/basic", authMiddleware, async (req: TenantRequest, res) => {
+    try {
+      const targetUserId = parseInt(String(req.params.id), 10);
+      if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+        return res.status(400).json({ error: "Invalid user id" });
+      }
+      if (!req.user?.organizationId) {
+        return res.status(401).json({ error: "User not authenticated" });
+      }
+
+      const role = String(req.user.role || "").toLowerCase();
+      const isStaff = ["admin", "doctor", "nurse", "receptionist"].includes(role);
+      const isSelf = Number(req.user.id) === targetUserId;
+      if (!isStaff && !isSelf) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      const organizationId = Number(req.user.organizationId);
+      const r = await pool.query<{
+        id: number;
+        first_name: string | null;
+        last_name: string | null;
+        email: string | null;
+        role: string | null;
+        profile_picture_path: string | null;
+      }>(
+        `SELECT id, first_name, last_name, email, role, profile_picture_path
+         FROM users
+         WHERE id = $1 AND organization_id = $2
+         LIMIT 1`,
+        [targetUserId, organizationId],
+      );
+      if (!r.rows?.[0]) return res.status(404).json({ error: "User not found" });
+
+      const row = r.rows[0];
+      return res.json({
+        id: row.id,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        email: row.email,
+        role: row.role,
+        profilePicturePath: row.profile_picture_path,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || "Failed to fetch user" });
+    }
+  });
+
+  // Admin: upload profile picture for any user in same organization
+  app.post(
+    "/api/users/:id/profile-picture",
+    authMiddleware,
+    requireRole(["admin"]),
+    (req: any, res: any, next: any) => {
+      // Reuse the same multer config but write into the *target* user's folder.
+      const targetUserId = parseInt(String(req.params.id), 10);
+      if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+        return res.status(400).json({ error: "Invalid user id" });
+      }
+
+      const originalOrgId = req.user?.organizationId;
+      const originalUserId = req.user?.id;
+      req.user = { ...(req.user || {}), id: targetUserId };
+      uploadUserProfilePicture.single("image")(req, res, (err: any) => {
+        // restore (defensive)
+        req.user = { ...(req.user || {}), id: originalUserId, organizationId: originalOrgId };
+        if (err) return next(err);
+        return next();
+      });
+    },
+    async (req: TenantRequest, res) => {
+      try {
+        const targetUserId = parseInt(String(req.params.id), 10);
+        if (!req.user?.organizationId) return res.status(401).json({ error: "User not authenticated" });
+        if (!Number.isFinite(targetUserId) || targetUserId <= 0) return res.status(400).json({ error: "Invalid user id" });
+
+        const organizationId = Number(req.user.organizationId);
+        const file = (req as any).file as Express.Multer.File | undefined;
+        if (!file) return res.status(400).json({ error: "Image is required (field: image)" });
+
+        // Ensure target user exists in same organization
+        const existsRes = await pool.query<{ id: number }>(
+          `SELECT id FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+          [targetUserId, organizationId],
+        );
+        if (!existsRes.rows?.[0]?.id) return res.status(404).json({ error: "User not found" });
+
+        const relativeUrl = `/uploads/profile_pictures/${organizationId}/users/${targetUserId}/${encodeURIComponent(
+          file.filename,
+        )}`;
+
+        // Delete old profile picture if present (best-effort)
+        try {
+          const oldRes = await pool.query<{ profile_picture_path: string | null }>(
+            `SELECT profile_picture_path FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+            [targetUserId, organizationId],
+          );
+          const oldPath = oldRes.rows?.[0]?.profile_picture_path;
+          if (oldPath && String(oldPath).startsWith("/uploads/profile_pictures/")) {
+            const abs = path.join(process.cwd(), String(oldPath).replace(/^\/+/, ""));
+            await fs.promises.unlink(abs).catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
+
+        await pool.query(
+          `UPDATE users
+           SET profile_picture_path = $1
+           WHERE id = $2 AND organization_id = $3`,
+          [relativeUrl, targetUserId, organizationId],
+        );
+
+        return res.json({ success: true, profilePicturePath: relativeUrl, url: relativeUrl });
+      } catch (error: any) {
+        const msg = String(error?.message || error || "Upload failed");
+        const isValidation =
+          /Invalid file type|File too large|LIMIT_FILE_SIZE/i.test(msg) ||
+          /Only JPG|JPEG|PNG|WebP/i.test(msg);
+        return res.status(isValidation ? 400 : 500).json({ error: msg });
+      }
+    },
+  );
+
+  // Admin: delete profile picture for any user in same organization
+  app.delete("/api/users/:id/profile-picture", authMiddleware, requireRole(["admin"]), async (req: TenantRequest, res) => {
+    try {
+      const targetUserId = parseInt(String(req.params.id), 10);
+      if (!req.user?.organizationId) return res.status(401).json({ error: "User not authenticated" });
+      if (!Number.isFinite(targetUserId) || targetUserId <= 0) return res.status(400).json({ error: "Invalid user id" });
+
+      const organizationId = Number(req.user.organizationId);
+
+      const oldRes = await pool.query<{ profile_picture_path: string | null }>(
+        `SELECT profile_picture_path FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
+        [targetUserId, organizationId],
+      );
+      if (oldRes.rowCount === 0) return res.status(404).json({ error: "User not found" });
+      const oldPath = oldRes.rows?.[0]?.profile_picture_path;
+
+      if (oldPath && String(oldPath).startsWith("/uploads/profile_pictures/")) {
+        const abs = path.join(process.cwd(), String(oldPath).replace(/^\/+/, ""));
+        await fs.promises.unlink(abs).catch(() => {});
+      }
+
+      await pool.query(
+        `UPDATE users
+         SET profile_picture_path = NULL
+         WHERE id = $1 AND organization_id = $2`,
+        [targetUserId, organizationId],
+      );
+
+      return res.json({ success: true, profilePicturePath: null });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || "Failed to delete profile picture" });
+    }
+  });
+
+  // Example response shape (success):
+  // {
+  //   "success": true,
+  //   "profilePicturePath": "/uploads/profile_pictures/<orgId>/users/<userId>/<filename>.png",
+  //   "url": "/uploads/profile_pictures/<orgId>/users/<userId>/<filename>.png"
+  // }
 
   // Stripe payment route for imaging invoices
   app.post("/api/create-payment-intent", async (req, res) => {
@@ -5507,9 +5850,28 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       // Get AI insights for this patient
       const aiInsights = await storage.getAiInsightsByPatient(patientId, req.tenant!.id);
 
+      // If patient is linked to a user, include the user's profile picture path
+      let linkedUserProfilePicturePath: string | null = null;
+      try {
+        const linkedUserId = (patient as any)?.userId;
+        if (linkedUserId) {
+          const r = await pool.query<{ profile_picture_path: string | null }>(
+            `SELECT profile_picture_path
+             FROM users
+             WHERE id = $1 AND organization_id = $2
+             LIMIT 1`,
+            [Number(linkedUserId), Number(req.tenant!.id)],
+          );
+          linkedUserProfilePicturePath = r.rows?.[0]?.profile_picture_path ?? null;
+        }
+      } catch {
+        linkedUserProfilePicturePath = null;
+      }
+
       res.json({
         ...patient,
-        aiInsights
+        aiInsights,
+        linkedUserProfilePicturePath,
       });
     } catch (error) {
       console.error("Patient fetch error:", error);
@@ -7510,6 +7872,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         appointmentType: req.body.appointmentType ?? req.body.appointment_type,
         treatmentId: req.body.treatmentId ?? req.body.treatment_id ?? null,
         consultationId: req.body.consultationId ?? req.body.consultation_id ?? null,
+        rescheduledFromId: req.body.rescheduledFromId ?? req.body.rescheduled_from_id ?? null,
       };
 
       const appointmentData = z.object({
@@ -7546,6 +7909,15 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         appointmentType: z.enum(["consultation", "treatment"]).default("consultation"),
         treatmentId: z.number().int().optional().nullable(),
         consultationId: z.number().int().optional().nullable(),
+        rescheduledFromId: z
+          .union([z.number(), z.string()])
+          .optional()
+          .transform((v) => {
+            if (v == null || v === "") return null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          })
+          .nullable(),
         location: z.string().optional(),
         department: z.string().optional(),
         notes: z.string().optional(),
@@ -7902,6 +8274,147 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const patient = await storage.getPatient(numericPatientId, req.tenant!.id);
       const provider = await storage.getUser(appointmentData.providerId, req.tenant!.id);
 
+      // If this appointment was created as part of a reschedule flow, email both patient + provider
+      // with previous vs new appointment details.
+      if (appointmentData.rescheduledFromId && patient && provider) {
+        try {
+          const oldDbId = Number(appointmentData.rescheduledFromId);
+          const oldRes = await pool.query(
+            `SELECT id,
+                    appointment_id,
+                    scheduled_at,
+                    to_char(scheduled_at::timestamp, 'YYYY-MM-DD') AS scheduled_date,
+                    to_char(scheduled_at::timestamp, 'HH24:MI') AS scheduled_time,
+                    duration,
+                    appointment_type,
+                    treatment_id,
+                    consultation_id
+             FROM appointments
+             WHERE organization_id = $1 AND id = $2
+             LIMIT 1`,
+            [req.tenant!.id, oldDbId],
+          );
+          const oldApt = oldRes.rows?.[0] || null;
+
+          const formatTime12h = (hhmm: any): string => {
+            const s = String(hhmm ?? "").trim();
+            const m = s.match(/^(\d{1,2}):(\d{2})$/);
+            if (!m) return s || "—";
+            let h = parseInt(m[1], 10);
+            const min = m[2];
+            if (Number.isNaN(h)) return s || "—";
+            const ampm = h >= 12 ? "PM" : "AM";
+            h = h % 12;
+            if (h === 0) h = 12;
+            return `${String(h).padStart(2, "0")}:${min} ${ampm}`;
+          };
+
+          const patientEmail = patient?.email ? String(patient.email).trim() : "";
+          const providerEmail = provider?.email ? String(provider.email).trim() : "";
+          const recipients = Array.from(new Set([patientEmail, providerEmail].filter(Boolean)));
+          if (recipients.length > 0) {
+            // Try to resolve service label
+            let serviceLabel = "";
+            const newKind = String(appointmentToCreate.appointmentType || "").toLowerCase();
+            const newTid = (appointmentToCreate as any).treatmentId ?? null;
+            const newCid = (appointmentToCreate as any).consultationId ?? null;
+            if (newKind === "treatment" && newTid) {
+              const tRes = await pool.query(
+                `SELECT name FROM treatments WHERE organization_id = $1 AND id = $2 LIMIT 1`,
+                [req.tenant!.id, Number(newTid)],
+              );
+              serviceLabel = tRes.rows?.[0]?.name ? `Treatment: ${String(tRes.rows[0].name)}` : "";
+            } else if (newKind === "consultation" && newCid) {
+              const cRes = await pool.query(
+                `SELECT service_name FROM doctors_fee WHERE organization_id = $1 AND id = $2 LIMIT 1`,
+                [req.tenant!.id, Number(newCid)],
+              );
+              serviceLabel = cRes.rows?.[0]?.service_name ? `Consultation: ${String(cRes.rows[0].service_name)}` : "";
+            }
+
+            const clinicName = (req.tenant as any)?.brandName || (req.tenant as any)?.name || "Clinic";
+            const patientName = `${patient.firstName ?? ""} ${patient.lastName ?? ""}`.trim() || "Patient";
+            const doctorName = `${provider.firstName ?? ""} ${provider.lastName ?? ""}`.trim() || "Doctor";
+
+            const oldIdText = oldApt?.appointment_id ? String(oldApt.appointment_id) : String(oldDbId);
+            const oldDate = oldApt?.scheduled_date || "—";
+            const oldTime = formatTime12h(oldApt?.scheduled_time);
+            const oldDur = oldApt?.duration ?? "—";
+
+            const newScheduled = String(appointmentToCreate.scheduledAt || "");
+            const newDt = newScheduled ? newScheduled.substring(0, 10) : "—";
+            const newTime = newScheduled ? formatTime12h(newScheduled.substring(11, 16)) : "—";
+            const newDur = appointmentToCreate.duration ?? 30;
+            const newAptIdText =
+              (appointment as any)?.appointmentId ??
+              (appointment as any)?.appointment_id ??
+              (appointment as any)?.id ??
+              "—";
+
+            const subject = `Appointment Rescheduled (${oldIdText} → ${newAptIdText}) - ${clinicName}`;
+            const text = `Hello ${patientName},
+
+Your appointment has been rescheduled successfully.
+
+Doctor: ${doctorName}
+${serviceLabel ? `${serviceLabel}\n` : ""}Previous appointment:
+- ID: ${oldIdText}
+- Date: ${oldDate}
+- Time: ${oldTime}
+- Duration: ${oldDur} minutes
+
+New appointment:
+- ID: ${newAptIdText}
+- Date: ${newDt}
+- Time: ${newTime}
+- Duration: ${newDur} minutes
+
+Thank you,
+${clinicName}`;
+
+            const html = `<!doctype html>
+<html>
+  <body style="margin:0; padding:0; font-family: Arial, sans-serif; background:#f5f5f5;">
+    <div style="max-width:760px; margin:0 auto; background:#ffffff; padding:24px;">
+      <h2 style="margin:0 0 10px 0; color:#111827;">Appointment Rescheduled Successfully</h2>
+      <p style="margin:0 0 16px 0; color:#374151;">Hello <strong>${patientName}</strong>, your appointment has been rescheduled.</p>
+      <p style="margin:0 0 16px 0; color:#374151;"><strong>Doctor:</strong> ${doctorName}<br/>${serviceLabel ? `<strong>${serviceLabel}</strong><br/>` : ""}</p>
+
+      <div style="display:flex; gap:14px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:280px; border:1px solid #E5E7EB; border-radius:12px; padding:14px;">
+          <div style="font-weight:700; color:#111827; margin-bottom:10px;">Existing appointment</div>
+          <div style="color:#374151;"><strong>ID:</strong> ${oldIdText}</div>
+          <div style="color:#374151;"><strong>Date:</strong> ${oldDate}</div>
+          <div style="color:#374151;"><strong>Time:</strong> ${oldTime}</div>
+          <div style="color:#374151;"><strong>Duration:</strong> ${oldDur} minutes</div>
+        </div>
+
+        <div style="flex:1; min-width:280px; border:1px solid #E5E7EB; border-radius:12px; padding:14px;">
+          <div style="font-weight:700; color:#111827; margin-bottom:10px;">New appointment</div>
+          <div style="color:#374151;"><strong>ID:</strong> ${newAptIdText}</div>
+          <div style="color:#374151;"><strong>Date:</strong> ${newDt}</div>
+          <div style="color:#374151;"><strong>Time:</strong> ${newTime}</div>
+          <div style="color:#374151;"><strong>Duration:</strong> ${newDur} minutes</div>
+        </div>
+      </div>
+
+      <p style="margin:18px 0 0 0; color:#6B7280; font-size:13px; line-height:1.6;">
+        If you did not request this change, please contact <strong>${clinicName}</strong>.
+      </p>
+    </div>
+  </body>
+</html>`;
+
+            const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || "noreply@curaemr.ai";
+            await Promise.allSettled(
+              recipients.map((to) => emailService.sendEmail({ to, from, subject, text, html })),
+            );
+          }
+        } catch (mailErr) {
+          console.warn("[APPOINTMENTS] reschedule email failed:", mailErr);
+        }
+      }
+
       // Create notifications for appointment creation
       if (patient && provider) {
         const appointmentDate = new Date(appointmentToCreate.scheduledAt!);
@@ -8203,12 +8716,34 @@ This treatment plan should be reviewed and adjusted based on individual patient 
     }
   });
 
-  app.patch("/api/appointments/:id", authMiddleware, requireModulePermission('appointments', 'edit'), async (req: TenantRequest, res) => {
+  app.patch(
+    "/api/appointments/:id",
+    authMiddleware,
+    async (req: TenantRequest, res, next) => {
+      // Special case: Allow patients to update (only) their own appointment status
+      if (req.user?.role === "patient") {
+        return next();
+      }
+      return requireModulePermission("appointments", "edit")(req, res, next);
+    },
+    async (req: TenantRequest, res) => {
     try {
       const appointmentId = parseInt(req.params.id);
 
       if (isNaN(appointmentId)) {
         return res.status(400).json({ error: "Invalid appointment ID" });
+      }
+
+      // Patient can only patch their own appointments
+      if (req.user?.role === "patient") {
+        const existingAppointment = await storage.getAppointment(appointmentId, req.tenant!.id);
+        if (!existingAppointment) {
+          return res.status(404).json({ error: "Appointment not found" });
+        }
+        const patient = await storage.getPatientByUserId(req.user.id, req.tenant!.id);
+        if (!patient || Number(existingAppointment.patientId) !== Number(patient.id)) {
+          return res.status(403).json({ error: "You can only update your own appointments" });
+        }
       }
 
       const updateData = z.object({
@@ -18630,6 +19165,699 @@ This treatment plan should be reviewed and adjusted based on individual patient 
     } catch (error) {
       console.error("[SHARE-LINK] Error:", error);
       res.status(500).json({ error: "Failed to generate link" });
+    }
+  });
+
+  // Send patient self-registration link (staff) - generate token and send mail
+  app.post("/api/patients/share-self-registration-link", authMiddleware, requireNonPatientRole(), async (req: TenantRequest, res) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "User not authenticated" });
+
+      const { email, portalAccess } = z
+        .object({
+          email: z.string().email(),
+          portalAccess: z.boolean().optional().default(true),
+        })
+        .parse(req.body || {});
+
+      const organizationId = (req.user as any).organizationId ?? req.tenant?.id;
+      if (!organizationId) return res.status(400).json({ error: "Organization ID is required" });
+
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const existingUser = await storage.getUserByEmail(normalizedEmail, organizationId);
+      if (existingUser) {
+        const existingName =
+          `${existingUser.firstName ?? ""} ${existingUser.lastName ?? ""}`.trim() ||
+          existingUser.email ||
+          "User";
+        const existingRole = String(existingUser.role || "").trim() || "unknown";
+        return res.status(409).json({
+          error: "This email already exists. Try with another email.",
+          code: "EMAIL_ALREADY_EXISTS",
+          existingUser: {
+            id: existingUser.id,
+            name: existingName,
+            role: existingRole,
+            email: existingUser.email,
+          },
+        });
+      }
+
+      // Also block if the email exists in another organization (global uniqueness / cross-tenant safety)
+      // Use a case/whitespace-insensitive lookup (stored emails are not always normalized).
+      const existingUserGlobalRes = await pool.query(
+        `SELECT id, email, first_name, last_name, role, organization_id
+         FROM users
+         WHERE lower(trim(email)) = $1
+         LIMIT 1`,
+        [normalizedEmail],
+      );
+      const existingUserGlobal = existingUserGlobalRes.rows?.[0] || null;
+      if (existingUserGlobal && Number(existingUserGlobal.organization_id) !== Number(organizationId)) {
+        const otherOrg = await storage.getOrganization(Number(existingUserGlobal.organization_id));
+        const otherOrgName = (otherOrg as any)?.name || "another organization";
+        const otherSubdomain = (otherOrg as any)?.subdomain || (otherOrg as any)?.slug || null;
+        const existingName =
+          `${existingUserGlobal.first_name ?? ""} ${existingUserGlobal.last_name ?? ""}`.trim() ||
+          existingUserGlobal.email ||
+          "User";
+        const existingRole = String(existingUserGlobal.role || "").trim() || "unknown";
+        return res.status(409).json({
+          error: "This email is associated with another organization.",
+          code: "EMAIL_IN_OTHER_ORG",
+          existingUser: {
+            id: existingUserGlobal.id,
+            name: existingName,
+            role: existingRole,
+            email: existingUserGlobal.email,
+          },
+          organization: {
+            id: existingUserGlobal.organization_id,
+            name: otherOrgName,
+            subdomain: otherSubdomain,
+          },
+        });
+      }
+
+      const org = await storage.getOrganization(organizationId);
+      const subdomain = (org as any)?.subdomain || (org as any)?.slug || "demo";
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS patient_registration_invites (
+          id SERIAL PRIMARY KEY,
+          organization_slug TEXT NOT NULL,
+          email_to TEXT NOT NULL,
+          token TEXT UNIQUE NOT NULL,
+          portal_access BOOLEAN NOT NULL DEFAULT true,
+          status TEXT NOT NULL DEFAULT 'sent',
+          expires_at TIMESTAMPTZ,
+          created_by_user_id INTEGER,
+          created_at TIMESTAMPTZ DEFAULT now(),
+          used_at TIMESTAMPTZ
+        )
+      `);
+
+      const token = `PR_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const expiresAt = new Date(Date.now() + 72 * 3600 * 1000); // 72h
+
+      await pool.query(
+        `INSERT INTO patient_registration_invites
+          (organization_slug, email_to, token, portal_access, status, expires_at, created_by_user_id)
+         VALUES ($1, $2, $3, $4, 'sent', $5, $6)`,
+        [subdomain, normalizedEmail, token, !!portalAccess, expiresAt, req.user.id],
+      );
+
+      const pathOnly = `/${encodeURIComponent(subdomain)}/register?token=${encodeURIComponent(token)}`;
+      const publicBase =
+        process.env.PUBLIC_APP_URL ||
+        process.env.APP_PUBLIC_URL ||
+        process.env.APP_BASE_URL ||
+        process.env.WEB_BASE_URL ||
+        "";
+      const hostFallback = (() => {
+        try {
+          const proto = (req as any).protocol || "http";
+          const host = req.get && req.get("host");
+          return host ? `${proto}://${host}` : "";
+        } catch {
+          return "";
+        }
+      })();
+      const baseUrl = (publicBase || hostFallback).replace(/\/$/, "");
+      const link = baseUrl ? `${baseUrl}${pathOnly}` : pathOnly;
+
+      // best-effort email
+      try {
+        const clinicHeader = await storage.getActiveClinicHeader(organizationId);
+        const clinicFooter = await storage.getActiveClinicFooter(organizationId);
+        await emailService.sendEmail({
+          to: normalizedEmail,
+          subject: "Complete your patient registration",
+          html: generateBookingLinkEmailHTML({ link, clinicHeader, clinicFooter }),
+          text: `Hello,\n\nPlease use the link below to complete your patient registration:\n\n${link}\n\nThis link will expire in 72 hours.`,
+        });
+      } catch (mailErr) {
+        console.warn("[SELF-REGISTRATION-LINK] Email failed:", mailErr);
+      }
+
+      return res.json({
+        success: true,
+        link,
+        path: pathOnly,
+        baseUrl: baseUrl || null,
+        portalAccess: !!portalAccess,
+        expiresAt,
+      });
+    } catch (error) {
+      console.error("[SELF-REGISTRATION-LINK] Error:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: error.errors });
+      }
+      return res.status(500).json({ error: "Failed to generate registration link" });
+    }
+  });
+
+  // Public: validate patient self-registration token
+  app.get("/api/public/:subdomain/patient-registration-token/:token", async (req: TenantRequest, res) => {
+    try {
+      const subdomain = String(req.params.subdomain || "").trim();
+      const token = String(req.params.token || "").trim();
+      if (!subdomain || !token) return res.status(400).json({ error: "Invalid request" });
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS patient_registration_invites (
+          id SERIAL PRIMARY KEY,
+          organization_slug TEXT NOT NULL,
+          email_to TEXT NOT NULL,
+          token TEXT UNIQUE NOT NULL,
+          portal_access BOOLEAN NOT NULL DEFAULT true,
+          status TEXT NOT NULL DEFAULT 'sent',
+          expires_at TIMESTAMPTZ,
+          created_by_user_id INTEGER,
+          created_at TIMESTAMPTZ DEFAULT now(),
+          used_at TIMESTAMPTZ
+        )
+      `);
+
+      const row = await pool.query(
+        `SELECT id, email_to, portal_access, status, expires_at, used_at
+         FROM patient_registration_invites
+         WHERE organization_slug = $1 AND token = $2
+         LIMIT 1`,
+        [subdomain, token],
+      );
+      if (row.rows.length === 0) {
+        return res.status(404).json({ error: "Token not found" });
+      }
+
+      const invite = row.rows[0];
+      const expiresAt = invite.expires_at ? new Date(invite.expires_at) : null;
+      if (expiresAt && expiresAt.getTime() < Date.now()) {
+        return res.status(410).json({ error: "Token expired" });
+      }
+      if (String(invite.status || "").toLowerCase() === "used" || invite.used_at) {
+        return res.status(409).json({ error: "Token already used" });
+      }
+
+      return res.json({
+        valid: true,
+        email: invite.email_to,
+        portalAccess: !!invite.portal_access,
+        expiresAt: invite.expires_at,
+      });
+    } catch (error) {
+      console.error("[PUBLIC-SELF-REG-TOKEN] Error:", error);
+      return res.status(500).json({ error: "Failed to validate token" });
+    }
+  });
+
+  // Public: UK postcode lookup proxy (avoids CSP connect-src issues in browser)
+  app.get("/api/public/:subdomain/postcode-lookup", async (req: TenantRequest, res) => {
+    try {
+      const subdomain = String(req.params.subdomain || "").trim();
+      if (!subdomain) return res.status(400).json({ error: "Invalid subdomain" });
+
+      const pc = String(req.query?.postcode || "").trim();
+      if (!pc) return res.status(400).json({ error: "Postcode is required" });
+
+      // Use global fetch (Node 18+) to call postcodes.io server-side
+      const r = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(pc)}`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return res.status(422).json({ error: j?.error || "Could not find that postcode" });
+      }
+      return res.json(j);
+    } catch (error) {
+      console.error("[PUBLIC-POSTCODE-LOOKUP] Error:", error);
+      return res.status(500).json({ error: "Postcode lookup failed" });
+    }
+  });
+
+  // Public: UK postcode autocomplete proxy (returns string[] results)
+  app.get("/api/public/:subdomain/postcode-autocomplete", async (req: TenantRequest, res) => {
+    try {
+      const subdomain = String(req.params.subdomain || "").trim();
+      if (!subdomain) return res.status(400).json({ error: "Invalid subdomain" });
+
+      const pc = String(req.query?.postcode || "").trim();
+      if (!pc) return res.status(400).json({ error: "Postcode is required" });
+
+      const r = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(pc)}/autocomplete`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return res.status(422).json({ error: j?.error || "No addresses found" });
+      }
+      return res.json(j);
+    } catch (error) {
+      console.error("[PUBLIC-POSTCODE-AUTOCOMPLETE] Error:", error);
+      return res.status(500).json({ error: "Postcode autocomplete failed" });
+    }
+  });
+
+  // Browsers open links with GET — this URL is POST-only from the registration form
+  app.get("/api/public/:subdomain/patient-self-register", (req: TenantRequest, res) => {
+    const subdomain = String(req.params.subdomain || "").trim();
+    return res.status(405).set("Allow", "POST").json({
+      error: "This address accepts POST only. Open your clinic registration page and submit the form.",
+      hint: subdomain
+        ? `Use the app page /${encodeURIComponent(subdomain)}/register?token=… from your invite email, not this API URL.`
+        : "Use the registration link from your invite email (includes ?token=…).",
+    });
+  });
+
+  // Public: submit patient self-registration form
+  app.post("/api/public/:subdomain/patient-self-register", async (req: TenantRequest, res) => {
+    try {
+      const subdomain = String(req.params.subdomain || "").trim();
+      if (!subdomain) return res.status(400).json({ error: "Invalid subdomain" });
+
+      const insuranceInfoSchema = z
+        .object({
+          provider: z.string().optional(),
+          planType: z.string().optional(),
+          policyNumber: z.string().optional(),
+          memberNumber: z.string().optional(),
+          groupNumber: z.string().optional(),
+          effectiveDate: z.string().optional(),
+          expirationDate: z.string().optional(),
+        })
+        .optional()
+        .default({});
+
+      const dependentChildSchema = z
+        .object({
+          firstName: z.string().optional().default(""),
+          lastName: z.string().optional().default(""),
+          dateOfBirth: z.string().optional().default(""),
+          genderAtBirth: z.string().optional().default(""),
+          nhsNumber: z.string().optional().default(""),
+          phone: z.string().optional().default(""),
+        })
+        .optional()
+        .default({});
+
+      const body = z
+        .object({
+          token: z.string().min(5),
+          firstName: z.string().min(1),
+          lastName: z.string().min(1),
+          email: z.string().email(),
+          phone: z.string().min(1, "Phone is required"),
+          dateOfBirth: z.string().min(1, "Date of birth is required"),
+          genderAtBirth: z.string().min(1, "Gender at birth is required"),
+          nhsNumber: z.string().optional().default(""),
+          address: z
+            .object({
+              street: z.string().optional(),
+              city: z.string().optional(),
+              state: z.string().optional(),
+              postcode: z.string().optional(),
+              country: z.string().optional(),
+            })
+            .optional()
+            .default({}),
+          emergencyContact: z.object({
+            name: z.string().min(1, "Emergency contact name is required"),
+            relationship: z.string().min(1, "Relationship is required"),
+            phone: z.string().min(1, "Emergency contact phone is required"),
+            email: z.string().optional().default(""),
+          }),
+          insuranceInfo: insuranceInfoSchema,
+          department: z.string().optional().default(""),
+          password: z.string().optional().default(""),
+          confirmPassword: z.string().optional().default(""),
+          includeDependentChild: z.preprocess(
+            (v) => v === true || v === "true",
+            z.boolean().optional().default(false),
+          ),
+          dependentChild: dependentChildSchema,
+          consentAccepted: z.preprocess(
+            (val) => val === true || val === "true",
+            z.boolean().refine((v) => v === true, { message: "You must accept the terms to register" }),
+          ),
+        })
+        .superRefine((data, ctx) => {
+          const selfDob = parseIsoDateOnlyUTC(data.dateOfBirth);
+          if (!selfDob) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Enter a valid date of birth",
+              path: ["dateOfBirth"],
+            });
+          } else {
+            const today = startOfTodayUtcDate();
+            if (selfDob.getTime() > today.getTime()) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Date of birth cannot be in the future",
+                path: ["dateOfBirth"],
+              });
+            }
+            const selfAge = ageYearsFromDobUTC(selfDob);
+            if (selfAge > 130) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Please check the date of birth",
+                path: ["dateOfBirth"],
+              });
+            }
+          }
+
+          const ecEmail = String(data.emergencyContact?.email || "").trim();
+          if (ecEmail && !z.string().email().safeParse(ecEmail).success) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Enter a valid emergency contact email or leave it blank",
+              path: ["emergencyContact", "email"],
+            });
+          }
+
+          const ins = data.insuranceInfo || {};
+          const eff = String(ins.effectiveDate || "").trim();
+          if (eff && !parseIsoDateOnlyUTC(eff)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Enter a valid insurance effective date",
+              path: ["insuranceInfo", "effectiveDate"],
+            });
+          }
+          const exp = String(ins.expirationDate || "").trim();
+          if (exp && !parseIsoDateOnlyUTC(exp)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Enter a valid insurance end date",
+              path: ["insuranceInfo", "expirationDate"],
+            });
+          }
+
+          const nhs = String(data.nhsNumber || "").replace(/\s/g, "");
+          if (nhs && !/^\d{10}$/.test(nhs)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "NHS number must be 10 digits",
+              path: ["nhsNumber"],
+            });
+          }
+
+          if (!data.includeDependentChild) return;
+          const d = data.dependentChild || {};
+          if (!String(d.firstName || "").trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Dependent first name is required", path: ["dependentChild", "firstName"] });
+          }
+          if (!String(d.lastName || "").trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Dependent last name is required", path: ["dependentChild", "lastName"] });
+          }
+          if (!String(d.dateOfBirth || "").trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Dependent date of birth is required", path: ["dependentChild", "dateOfBirth"] });
+          }
+          if (!String(d.genderAtBirth || "").trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Dependent gender at birth is required", path: ["dependentChild", "genderAtBirth"] });
+          }
+
+          const depDobStr = String(d.dateOfBirth || "").trim();
+          if (depDobStr) {
+            const depDob = parseIsoDateOnlyUTC(depDobStr);
+            if (!depDob) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Enter a valid dependent date of birth",
+                path: ["dependentChild", "dateOfBirth"],
+              });
+            } else {
+              const today = startOfTodayUtcDate();
+              if (depDob.getTime() > today.getTime()) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  message: "Dependent date of birth cannot be in the future",
+                  path: ["dependentChild", "dateOfBirth"],
+                });
+              }
+              const depAge = ageYearsFromDobUTC(depDob);
+              if (depAge >= 18) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  message: "Dependent must be under 18. Use a separate registration for adults.",
+                  path: ["dependentChild", "dateOfBirth"],
+                });
+              }
+            }
+          }
+
+          const depNhs = String(d.nhsNumber || "").replace(/\s/g, "");
+          if (depNhs && !/^\d{10}$/.test(depNhs)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "Dependent NHS number must be 10 digits",
+              path: ["dependentChild", "nhsNumber"],
+            });
+          }
+        })
+        .parse(req.body || {});
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS patient_registration_invites (
+          id SERIAL PRIMARY KEY,
+          organization_slug TEXT NOT NULL,
+          email_to TEXT NOT NULL,
+          token TEXT UNIQUE NOT NULL,
+          portal_access BOOLEAN NOT NULL DEFAULT true,
+          status TEXT NOT NULL DEFAULT 'sent',
+          expires_at TIMESTAMPTZ,
+          created_by_user_id INTEGER,
+          created_at TIMESTAMPTZ DEFAULT now(),
+          used_at TIMESTAMPTZ
+        )
+      `);
+
+      // Resolve organization by subdomain (older DBs may not have a `slug` column)
+      const orgRes = await pool.query(
+        `SELECT id, name, subdomain FROM organizations WHERE subdomain = $1 LIMIT 1`,
+        [subdomain],
+      );
+      if (orgRes.rows.length === 0) {
+        return res.status(404).json({ error: "Organization not found" });
+      }
+      const organizationId = Number(orgRes.rows[0].id);
+
+      // Validate token belongs to org + not expired/used
+      const inviteRes = await pool.query(
+        `SELECT id, email_to, portal_access, status, expires_at, used_at
+         FROM patient_registration_invites
+         WHERE organization_slug = $1 AND token = $2
+         LIMIT 1`,
+        [subdomain, body.token],
+      );
+      if (inviteRes.rows.length === 0) {
+        return res.status(404).json({ error: "Token not found" });
+      }
+      const invite = inviteRes.rows[0];
+      const expiresAt = invite.expires_at ? new Date(invite.expires_at) : null;
+      if (expiresAt && expiresAt.getTime() < Date.now()) {
+        return res.status(410).json({ error: "Token expired" });
+      }
+      if (String(invite.status || "").toLowerCase() === "used" || invite.used_at) {
+        return res.status(409).json({ error: "Token already used" });
+      }
+
+      // Enforce invited email (locks the email field client-side too)
+      const invitedEmail = String(invite.email_to || "").trim().toLowerCase();
+      const submittedEmail = String(body.email || "").trim().toLowerCase();
+      if (invitedEmail && invitedEmail !== submittedEmail) {
+        return res.status(400).json({ error: "Email does not match invite" });
+      }
+
+      // Create (or reuse) User if portal access enabled
+      let createdUser: any = null;
+      let userId: number | null = null;
+      const enablePortalAccess = !!invite.portal_access;
+
+      let plainPassword: string | null = null;
+      if (enablePortalAccess) {
+        const existingUser = await storage.getUserByEmailGlobal(submittedEmail);
+        if (existingUser) {
+          if (existingUser.organizationId !== organizationId) {
+            return res.status(409).json({
+              error:
+                "This email is already registered to another clinic account. Use the email from your invite or contact support.",
+            });
+          }
+          if (String(existingUser.role || "").toLowerCase() !== "patient") {
+            return res.status(409).json({
+              error: "This email is already used by a staff account. Please use a different personal email for patient registration.",
+            });
+          }
+          const existingForUser = await storage.getPatientsByUserId(organizationId, existingUser.id);
+          if (existingForUser.some((p) => String(p.relation || "").trim().toLowerCase() === "self")) {
+            return res.status(409).json({
+              error: "A patient profile already exists for this account at this clinic. Sign in or ask reception for help.",
+            });
+          }
+          userId = existingUser.id;
+        } else {
+          const pw = String(body.password || "").trim();
+          const pwConfirm = String(body.confirmPassword || "").trim();
+          let passwordHash: string;
+          if (pw) {
+            if (pw.length < 8) {
+              return res.status(400).json({ error: "Password must be at least 8 characters" });
+            }
+            if (pw !== pwConfirm) {
+              return res.status(400).json({ error: "Passwords do not match" });
+            }
+            passwordHash = await authService.hashPassword(pw);
+            plainPassword = null;
+          } else {
+            plainPassword = `PT_${Math.random().toString(36).slice(2, 8)}${Math.random().toString(36).slice(2, 8)}`;
+            passwordHash = await authService.hashPassword(plainPassword);
+          }
+          const defaultPermissions = getDefaultPermissionsByRole("patient");
+          const dept = String(body.department || "").trim();
+          createdUser = await storage.createUser({
+            organizationId,
+            email: submittedEmail,
+            username: submittedEmail,
+            firstName: body.firstName,
+            lastName: body.lastName,
+            role: "patient",
+            isActive: true,
+            phone: body.phone || "",
+            dateOfBirth: body.dateOfBirth,
+            genderAtBirth: body.genderAtBirth,
+            ...(dept ? { department: dept } : {}),
+            passwordHash,
+            permissions: defaultPermissions,
+          } as any);
+          userId = createdUser.id;
+
+          // Email credentials only when a temporary password was generated
+          if (plainPassword) {
+            try {
+              const userName = `${body.firstName} ${body.lastName}`.trim();
+              await emailService.sendNewUserAccountEmail(
+                submittedEmail,
+                userName,
+                plainPassword,
+                String(orgRes.rows[0].name || "Clinic"),
+                "patient",
+              );
+            } catch (mailErr) {
+              console.warn("[PUBLIC-SELF-REG] Welcome email failed:", mailErr);
+            }
+          }
+        }
+      }
+
+      // Create patient record (always)
+      const generatedPatientId = await allocateNextDisplayPatientId(organizationId);
+
+      const insRaw = body.insuranceInfo || {};
+      const isInsured = Boolean(
+        String(insRaw.provider || "").trim() ||
+          String(insRaw.policyNumber || "").trim() ||
+          String(insRaw.memberNumber || "").trim() ||
+          String(insRaw.planType || "").trim(),
+      );
+
+      const patient = await storage.createPatient({
+        organizationId,
+        userId: userId ?? undefined,
+        patientId: generatedPatientId,
+        firstName: body.firstName,
+        lastName: body.lastName,
+        relation: "Self",
+        dateOfBirth: body.dateOfBirth ? body.dateOfBirth : undefined,
+        genderAtBirth: body.genderAtBirth,
+        email: submittedEmail,
+        phone: body.phone || "",
+        nhsNumber: String(body.nhsNumber || "").trim() || undefined,
+        address: body.address || {},
+        emergencyContact: {
+          name: String(body.emergencyContact.name || "").trim(),
+          relationship: String(body.emergencyContact.relationship || "").trim(),
+          phone: String(body.emergencyContact.phone || "").trim(),
+          email: String(body.emergencyContact.email || "").trim() || undefined,
+        },
+        insuranceInfo: {
+          provider: String(insRaw.provider || "").trim() || undefined,
+          planType: String(insRaw.planType || "").trim() || undefined,
+          policyNumber: String(insRaw.policyNumber || "").trim() || undefined,
+          memberNumber: String(insRaw.memberNumber || "").trim() || undefined,
+          groupNumber: String(insRaw.groupNumber || "").trim() || undefined,
+          effectiveDate: String(insRaw.effectiveDate || "").trim() || undefined,
+          expirationDate: String(insRaw.expirationDate || "").trim() || undefined,
+        },
+        isInsured,
+        createdBy: null as any,
+      } as any);
+
+      let dependentPatient: { id: number; patientId: string } | null = null;
+      if (body.includeDependentChild && body.dependentChild) {
+        const d = body.dependentChild;
+        const generatedDependentPatientId = await allocateNextDisplayPatientId(organizationId);
+        const dep = await storage.createPatient({
+          organizationId,
+          userId: userId ?? undefined,
+          patientId: generatedDependentPatientId,
+          firstName: String(d.firstName || "").trim(),
+          lastName: String(d.lastName || "").trim(),
+          relation: "Dependent Child",
+          dateOfBirth: String(d.dateOfBirth || "").trim() || undefined,
+          genderAtBirth: String(d.genderAtBirth || "").trim(),
+          email: submittedEmail,
+          phone: String(d.phone || "").trim() || "",
+          nhsNumber: String(d.nhsNumber || "").trim() || undefined,
+          address: body.address || {},
+          emergencyContact: {
+            name: String(body.emergencyContact.name || "").trim(),
+            relationship: String(body.emergencyContact.relationship || "").trim(),
+            phone: String(body.emergencyContact.phone || "").trim(),
+            email: String(body.emergencyContact.email || "").trim() || undefined,
+          },
+          insuranceInfo: {},
+          isInsured: false,
+          createdBy: null as any,
+        } as any);
+        dependentPatient = { id: dep.id, patientId: dep.patientId };
+      }
+
+      await pool.query(
+        `UPDATE patient_registration_invites
+         SET status = 'used', used_at = now()
+         WHERE id = $1`,
+        [invite.id],
+      );
+
+      return res.json({
+        success: true,
+        portalAccess: enablePortalAccess,
+        patient: { id: patient.id, patientId: patient.patientId },
+        dependentPatient,
+        user: userId ? { id: userId, email: submittedEmail } : null,
+      });
+    } catch (error) {
+      console.error("[PUBLIC-SELF-REG] Error:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: error.errors });
+      }
+      const errAny = error as { code?: string; cause?: { code?: string } };
+      const errCode = errAny?.code || errAny?.cause?.code;
+      if (errCode === "23505") {
+        return res.status(409).json({
+          error:
+            "This registration conflicts with an existing record. If you already registered, sign in or request a new link from the clinic.",
+        });
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      if (process.env.NODE_ENV !== "production") {
+        return res.status(500).json({ error: "Registration failed", details: msg });
+      }
+      return res.status(500).json({ error: "Registration failed" });
     }
   });
   // Share lab result PDF via email to patient

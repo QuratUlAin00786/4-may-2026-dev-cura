@@ -505,10 +505,10 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   const [appointmentIdFilter, setAppointmentIdFilter] = useState<string>("all");
   const [appointmentIdPopoverOpen, setAppointmentIdPopoverOpen] = useState(false);
 
-  // Admin: default show only active appointments (scheduled/in_progress)
+  // Admin: default show all statuses (use dropdown to narrow)
   const [adminStatusFilter, setAdminStatusFilter] = useState<
     "active" | "scheduled" | "in_progress" | "completed" | "cancelled" | "rescheduled" | "no_show" | "all"
-  >("active");
+  >("all");
 
 
   // Convert time slot string to 24-hour format

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -97,6 +98,59 @@ function staffAppointmentStatusBadgeStyle(status: string | undefined): React.CSS
     backgroundColor: bg,
     color: norm === "completed" ? "#000000" : "#ffffff",
   };
+}
+
+function getRecordProfilePictureUrl(
+  record: { profilePicturePath?: string | null; profile_picture_path?: string | null } | null | undefined,
+): string | null {
+  const raw = record?.profilePicturePath ?? record?.profile_picture_path;
+  if (typeof raw !== "string") return null;
+  const t = raw.trim();
+  return t.length > 0 ? t : null;
+}
+
+function getPatientProfilePictureUrl(patient: any | null | undefined, usersData: any[]): string | null {
+  if (!patient) return null;
+  const direct = getRecordProfilePictureUrl(patient);
+  if (direct) return direct;
+  const uid = patient.userId ?? patient.user_id;
+  if (uid == null || !Array.isArray(usersData)) return null;
+  const linked = usersData.find((u: any) => String(u.id) === String(uid));
+  return getRecordProfilePictureUrl(linked);
+}
+
+function patientNameInitials(firstName?: string, lastName?: string): string {
+  const a = String(firstName ?? "").trim().charAt(0);
+  const b = String(lastName ?? "").trim().charAt(0);
+  const s = `${a}${b}`.toUpperCase();
+  return s || "?";
+}
+
+function PatientFaceAvatar({
+  patient,
+  usersData,
+  sizeClassName = "h-7 w-7",
+  fallbackTextClassName = "text-[10px]",
+}: {
+  patient: any | null | undefined;
+  usersData: any[];
+  sizeClassName?: string;
+  fallbackTextClassName?: string;
+}) {
+  const src = getPatientProfilePictureUrl(patient, usersData);
+  const alt = patient
+    ? `${String(patient.firstName ?? "").trim()} ${String(patient.lastName ?? "").trim()}`.trim() || "Patient"
+    : "Patient";
+  return (
+    <Avatar className={`${sizeClassName} shrink-0`}>
+      {src ? <AvatarImage src={src} alt={alt} /> : null}
+      <AvatarFallback
+        className={`bg-blue-100 text-blue-700 ${fallbackTextClassName} dark:bg-blue-900 dark:text-blue-200`}
+      >
+        {patient ? patientNameInitials(patient.firstName, patient.lastName) : "?"}
+      </AvatarFallback>
+    </Avatar>
+  );
 }
 
 export default function DoctorAppointments({ onNewAppointment }: { onNewAppointment?: () => void }) {
@@ -1748,9 +1802,9 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               <Clock className="h-4 w-4 text-gray-400 dark:text-gray-500" />
                               <span className="font-medium text-gray-900 dark:text-gray-100">{formatAppointmentTimeRange(appointment)}</span>
                             </div>
-                            <div className="flex items-center space-x-2 mt-1">
-                              <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                            <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{getPatientName(appointment.patientId)}</span>
+                            <div className="flex items-center gap-2 mt-1">
+                              <PatientFaceAvatar patient={patient} usersData={usersData} />
+                              <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{getPatientName(appointment.patientId)}</span>
                             </div>
                           {serviceLabel && (
                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Service: {serviceLabel}</p>
@@ -2074,7 +2128,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               ) : null}
                             </div>
                             <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                              <User className="h-4 w-4 shrink-0 text-gray-400" />
+                              <PatientFaceAvatar patient={patient} usersData={usersData} />
                               <span className="font-bold">
                                 {patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}
                               </span>
@@ -2168,7 +2222,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               <span className="font-semibold">{formatAppointmentTimeRange(appointment)}</span>
                             </div>
                             <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                              <User className="h-4 w-4 text-gray-400" />
+                              <PatientFaceAvatar patient={patient} usersData={usersData} />
                               <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
                             </div>
                             {patient && (
@@ -2476,7 +2530,12 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   </span>
                 </div>
                 <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                  <User className="h-4 w-4 text-blue-600" />
+                  <PatientFaceAvatar
+                    patient={nextAppointmentPatient}
+                    usersData={usersData}
+                    sizeClassName="h-8 w-8"
+                    fallbackTextClassName="text-xs"
+                  />
                   <span>{nextAppointmentPatient ? `${nextAppointmentPatient.firstName} ${nextAppointmentPatient.lastName}` : 'N/A'}</span>
                 </div>
                   <div className="space-y-1">
@@ -2776,7 +2835,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                             ) : null}
                           </div>
                           <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <User className="h-4 w-4 shrink-0 text-gray-400" />
+                            <PatientFaceAvatar patient={patient} usersData={usersData} />
                             <span className="font-bold">
                               {patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}
                             </span>
@@ -2866,7 +2925,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                             <span>{format(parseScheduledAtAsLocal(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
                           </div>
                           <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <User className="h-4 w-4 text-gray-400" />
+                            <PatientFaceAvatar patient={patient} usersData={usersData} />
                             <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
                           </div>
                           <div className="space-y-1">
@@ -3737,9 +3796,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     <span>{(detailsAppointment.status || "scheduled").toUpperCase()}</span>
                     <span>{formatAppointmentTimeRange(detailsAppointment)}</span>
                   </div>
-                  <p className="text-xl font-semibold text-gray-900 dark:text-gray-100">
-                    {patientEmail ? `${patientName} (${patientEmail})` : patientName}
-                  </p>
+                  <div className="flex items-start gap-3 text-xl font-semibold text-gray-900 dark:text-gray-100">
+                    <PatientFaceAvatar
+                      patient={patient}
+                      usersData={usersData}
+                      sizeClassName="h-12 w-12"
+                      fallbackTextClassName="text-sm"
+                    />
+                    <p className="min-w-0 flex-1 leading-snug">
+                      {patientEmail ? `${patientName} (${patientEmail})` : patientName}
+                    </p>
+                  </div>
                   {serviceInfo && (
                     <p className="text-sm text-gray-600 dark:text-gray-300">Service: {serviceInfo.name}</p>
                   )}

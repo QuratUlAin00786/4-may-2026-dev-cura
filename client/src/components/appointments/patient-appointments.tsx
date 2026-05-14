@@ -8,6 +8,7 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   Select,
   SelectContent,
@@ -73,6 +74,87 @@ function formatStatusLabelPatientAppointments(status: unknown): string {
   const raw = String(status ?? "").trim();
   if (!raw) return "UNKNOWN";
   return raw.replace(/\s+/g, "_").toUpperCase();
+}
+
+function getRecordProfilePictureUrl(
+  record: { profilePicturePath?: string | null; profile_picture_path?: string | null } | null | undefined,
+): string | null {
+  const raw = record?.profilePicturePath ?? record?.profile_picture_path;
+  if (typeof raw !== "string") return null;
+  const t = raw.trim();
+  return t.length > 0 ? t : null;
+}
+
+function getPatientRecordPictureUrl(patient: any | null | undefined, usersData: any[]): string | null {
+  if (!patient) return null;
+  const direct = getRecordProfilePictureUrl(patient);
+  if (direct) return direct;
+  const uid = patient.userId ?? patient.user_id;
+  if (uid == null || !Array.isArray(usersData)) return null;
+  const linked = usersData.find((u: any) => String(u.id) === String(uid));
+  return getRecordProfilePictureUrl(linked);
+}
+
+function profileNameInitials(firstName?: string, lastName?: string): string {
+  const a = String(firstName ?? "").trim().charAt(0);
+  const b = String(lastName ?? "").trim().charAt(0);
+  const s = `${a}${b}`.toUpperCase();
+  return s || "?";
+}
+
+function UserProfileAvatar({
+  user,
+  sizeClassName = "h-9 w-9",
+  fallbackClassName = "text-xs",
+}: {
+  user: any | null | undefined;
+  sizeClassName?: string;
+  fallbackClassName?: string;
+}) {
+  const src = getRecordProfilePictureUrl(user);
+  const alt =
+    user != null
+      ? `${String(user.firstName ?? "").trim()} ${String(user.lastName ?? "").trim()}`.trim() || "Provider"
+      : "Provider";
+  return (
+    <Avatar className={`${sizeClassName} shrink-0`}>
+      {src ? <AvatarImage src={src} alt={alt} /> : null}
+      <AvatarFallback
+        className={`bg-blue-100 text-blue-700 ${fallbackClassName} dark:bg-blue-900 dark:text-blue-200`}
+      >
+        {user ? profileNameInitials(user.firstName, user.lastName) : "?"}
+      </AvatarFallback>
+    </Avatar>
+  );
+}
+
+function PatientRecordAvatar({
+  patient,
+  usersData,
+  sizeClassName = "h-9 w-9",
+  fallbackClassName = "text-xs",
+}: {
+  patient: any | null | undefined;
+  usersData: any[];
+  sizeClassName?: string;
+  fallbackClassName?: string;
+}) {
+  const users = Array.isArray(usersData) ? usersData : [];
+  const src = getPatientRecordPictureUrl(patient, users);
+  const alt =
+    patient != null
+      ? `${String(patient.firstName ?? "").trim()} ${String(patient.lastName ?? "").trim()}`.trim() || "Patient"
+      : "Patient";
+  return (
+    <Avatar className={`${sizeClassName} shrink-0`}>
+      {src ? <AvatarImage src={src} alt={alt} /> : null}
+      <AvatarFallback
+        className={`bg-blue-100 text-blue-700 ${fallbackClassName} dark:bg-blue-900 dark:text-blue-200`}
+      >
+        {patient ? profileNameInitials(patient.firstName, patient.lastName) : "?"}
+      </AvatarFallback>
+    </Avatar>
+  );
 }
 
 function getStatusBadgePresentation(status: unknown): { className: string; style?: React.CSSProperties } {
@@ -2002,6 +2084,22 @@ export default function PatientAppointments({
                   </span>
                 </div>
 
+                {getDoctorSpecialtyData(nextAppointment.providerId).name && (
+                  <div className="flex items-center gap-2 min-w-0">
+                    <UserProfileAvatar
+                      user={getProviderWithRole(nextAppointment.providerId)}
+                      sizeClassName="h-10 w-10"
+                      fallbackClassName="text-xs"
+                    />
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Stethoscope className="h-5 w-5 shrink-0 text-blue-600 dark:text-blue-400" />
+                      <span className="min-w-0 truncate font-medium text-gray-700 dark:text-gray-300">
+                        {getDoctorSpecialtyData(nextAppointment.providerId).name}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 {getDoctorSpecialtyData(nextAppointment.providerId)
                   .subSpecialty && (
                   <div className="flex items-center space-x-2">
@@ -2386,11 +2484,14 @@ export default function PatientAppointments({
 
                           {/* Provider */}
                           {getDoctorSpecialtyData(appointment.providerId).name && (
-                            <div className="flex items-center space-x-2">
-                              <Stethoscope className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                              <span className="text-sm text-gray-700 dark:text-gray-300">
-                                {getDoctorSpecialtyData(appointment.providerId).name}
-                              </span>
+                            <div className="flex items-center gap-2 min-w-0">
+                              <UserProfileAvatar user={getProviderWithRole(appointment.providerId)} />
+                              <div className="flex min-w-0 items-center gap-2">
+                                <Stethoscope className="h-4 w-4 text-gray-400 dark:text-gray-500 shrink-0" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300 min-w-0 truncate">
+                                  {getDoctorSpecialtyData(appointment.providerId).name}
+                                </span>
+                              </div>
                             </div>
                           )}
 
@@ -2421,9 +2522,12 @@ export default function PatientAppointments({
                         {/* Right column */}
                         <div className="space-y-3 min-w-0">
                           {/* Patient */}
-                          <div className="flex items-center space-x-2">
-                            <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                            <span className="text-sm text-gray-700 dark:text-gray-300">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <PatientRecordAvatar
+                              patient={aptPatient ?? currentPatient}
+                              usersData={usersData ?? []}
+                            />
+                            <span className="text-sm text-gray-700 dark:text-gray-300 min-w-0 truncate">
                               {aptPatient
                                 ? `${aptPatient.firstName ?? ""} ${aptPatient.lastName ?? ""}`.trim() || "Patient"
                                 : currentPatient
@@ -2559,25 +2663,32 @@ export default function PatientAppointments({
                     
                     {/* Provider Information */}
                     {editingAppointment?.providerId && getProviderWithRole(editingAppointment.providerId) && (
-                      <div className="flex flex-wrap gap-6 text-sm text-gray-600 dark:text-gray-300">
-                        <div>
-                          <p className="text-[0.7rem] uppercase tracking-wider text-gray-500 dark:text-gray-400">
-                            Role
-                          </p>
-                          <p className="text-sm font-semibold text-gray-900 dark:text-white">
-                            {getProviderWithRole(editingAppointment.providerId)?.role ? 
-                              getProviderWithRole(editingAppointment.providerId)!.role.charAt(0).toUpperCase() + 
-                              getProviderWithRole(editingAppointment.providerId)!.role.slice(1) : 
-                              "Not set"}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-[0.7rem] uppercase tracking-wider text-gray-500 dark:text-gray-400">
-                            Provider
-                          </p>
-                          <p className="text-sm font-semibold text-gray-900 dark:text-white">
-                            {getProviderWithRole(editingAppointment.providerId)?.displayName || "Unknown"}
-                          </p>
+                      <div className="flex flex-wrap items-start gap-3">
+                        <UserProfileAvatar
+                          user={getProviderWithRole(editingAppointment.providerId)}
+                          sizeClassName="h-10 w-10"
+                          fallbackClassName="text-sm"
+                        />
+                        <div className="flex flex-wrap gap-6 text-sm text-gray-600 dark:text-gray-300">
+                          <div>
+                            <p className="text-[0.7rem] uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                              Role
+                            </p>
+                            <p className="text-sm font-semibold text-gray-900 dark:text-white">
+                              {getProviderWithRole(editingAppointment.providerId)?.role
+                                ? getProviderWithRole(editingAppointment.providerId)!.role.charAt(0).toUpperCase() +
+                                  getProviderWithRole(editingAppointment.providerId)!.role.slice(1)
+                                : "Not set"}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[0.7rem] uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                              Provider
+                            </p>
+                            <p className="text-sm font-semibold text-gray-900 dark:text-white">
+                              {getProviderWithRole(editingAppointment.providerId)?.displayName || "Unknown"}
+                            </p>
+                          </div>
                         </div>
                       </div>
                     )}

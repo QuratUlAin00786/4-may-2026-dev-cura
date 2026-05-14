@@ -17,6 +17,7 @@ import { multiTenantEnforcer, validateOrganizationFilter, withTenantIsolation } 
 import { initializeMultiTenantPackage, getMultiTenantPackage } from "./packages/multi-tenant-core";
 import { messagingService } from "./messaging-service";
 import { isDoctorLike } from './utils/role-utils.js';
+import { parseAppointmentWallClock } from "./appointment-wall-clock.js";
 // PayPal imports moved to dynamic imports to avoid initialization errors when credentials are missing
 import { gdprComplianceService } from "./services/gdpr-compliance";
 import { insertGdprConsentSchema, insertGdprDataRequestSchema, updateMedicalImageReportFieldSchema, medicationsDatabase, patientDrugInteractions, insuranceVerifications, type Appointment, organizations, subscriptions, users, User, patients, symptomChecks, quickbooksConnections, insertClinicHeaderSchema, insertClinicFooterSchema, doctorsFee, invoices, labResults, insertMessageTemplateSchema, passwordResetTokens, saasSubscriptions, saasPackages, saasPayments, organizationIntegrations, insertTreatmentSchema, insertTreatmentsInfoSchema, InsertSaaSSubscription, imagingPricing, scheduledVideoCalls, insertScheduledVideoCallSchema, messages, analyticsSubjects, analyticsSubjectTreatments } from "../shared/schema";
@@ -7805,9 +7806,9 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       // Overlap rule: [newStart, newEnd) overlaps [existingStart, existingEnd) if:
       // existingStart < newEnd AND existingEnd > newStart
       const overlapsSql = sql`
-        ${schema.appointments.scheduledAt} < (${scheduledAt}::timestamp + make_interval(mins => ${durationMins}))
+        ${schema.appointments.scheduledAt} < (${scheduledAt}::timestamp + (${durationMins}::int * interval '1 minute'))
         AND
-        (${schema.appointments.scheduledAt} + make_interval(mins => ${schema.appointments.duration})) > ${scheduledAt}::timestamp
+        (${schema.appointments.scheduledAt} + (COALESCE(${schema.appointments.duration}, 30)::int * interval '1 minute')) > ${scheduledAt}::timestamp
       `;
 
       // Check for patient conflicts (patient has overlapping appointment with any provider)
@@ -8479,16 +8480,13 @@ ${clinicName}`;
           const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
           const duration = Number((appointmentData as any)?.duration || 30);
           if (providerId && scheduledAt) {
-            // Fetch appointments for the correct local day (scheduledAt is stored as timestamp w/o timezone).
-            const dayStr = scheduledAt.substring(0, 10);
-            const day = dayStr ? new Date(`${dayStr}T00:00:00`) : new Date(scheduledAt);
             const existingAppointments = await storage.getAppointmentsByProvider(
               providerId,
               req.tenant!.id,
-              day,
+              scheduledAt,
             );
 
-            const start = new Date(scheduledAt);
+            const start = parseAppointmentWallClock(scheduledAt);
             const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
             const now = new Date();
 
@@ -8500,7 +8498,7 @@ ${clinicName}`;
             const conflicts = (existingAppointments || []).filter((existing: any) => {
               const st = normalizeStatus(existing.status);
               if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
-              const existingStart = new Date(existing.scheduledAt);
+              const existingStart = parseAppointmentWallClock(existing.scheduledAt);
               const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
               if (existingStart <= now && now < existingEnd) return false; // don't block ongoing
               return start < existingEnd && end > existingStart;
@@ -8539,16 +8537,13 @@ ${clinicName}`;
           const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
           const duration = Number((appointmentData as any)?.duration || 30);
           if (providerId && scheduledAt) {
-            // Fetch appointments for the correct local day (scheduledAt is stored as timestamp w/o timezone).
-            const dayStr = scheduledAt.substring(0, 10);
-            const day = dayStr ? new Date(`${dayStr}T00:00:00`) : new Date(scheduledAt);
             const existingAppointments = await storage.getAppointmentsByProvider(
               providerId,
               req.tenant!.id,
-              day,
+              scheduledAt,
             );
 
-            const start = new Date(scheduledAt);
+            const start = parseAppointmentWallClock(scheduledAt);
             const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
             const now = new Date();
 
@@ -8560,7 +8555,7 @@ ${clinicName}`;
             const conflicts = (existingAppointments || []).filter((existing: any) => {
               const st = normalizeStatus(existing.status);
               if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
-              const existingStart = new Date(existing.scheduledAt);
+              const existingStart = parseAppointmentWallClock(existing.scheduledAt);
               const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
               // Do not block booking if the existing appointment is currently ongoing.
               if (existingStart <= now && now < existingEnd) return false;

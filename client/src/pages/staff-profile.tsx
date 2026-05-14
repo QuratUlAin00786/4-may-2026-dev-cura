@@ -3,7 +3,7 @@ import { useRoute } from "wouter";
 import { Header } from "@/components/layout/header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Avatar, AvatarContent, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Stethoscope, Mail, Phone, MapPin, Calendar, Clock, User, Building } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import type { User as StaffMember } from "@/types";
@@ -11,6 +11,16 @@ import { isDoctorLike } from "@/lib/role-utils";
 
 function getInitials(firstName: string, lastName: string): string {
   return `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
+}
+
+function getStaffProfilePictureUrl(staff: {
+  profilePicturePath?: string | null;
+  profile_picture_path?: string | null;
+}): string | null {
+  const raw = staff?.profilePicturePath ?? staff?.profile_picture_path;
+  if (typeof raw !== "string") return null;
+  const t = raw.trim();
+  return t.length > 0 ? t : null;
 }
 
 const departmentColors: Record<string, string> = {
@@ -145,16 +155,17 @@ export default function StaffProfile() {
               <CardContent>
                 <div className="text-center">
                   <Avatar className="mx-auto h-24 w-24 mb-4 ring-2 ring-gray-200 dark:ring-slate-600 bg-gray-100 dark:bg-slate-700">
-                    <AvatarContent>
-                      {staffMember.profileImageUrl ? (
-                        <img src={staffMember.profileImageUrl} alt="Profile" className="object-cover" />
-                      ) : (
-                        <div className="flex items-center justify-center h-full w-full bg-gradient-to-br from-blue-500 to-purple-600 text-white text-lg font-semibold">
-                          {getInitials(staffMember.firstName, staffMember.lastName)}
-                        </div>
-                      )}
-                    </AvatarContent>
-                    <AvatarFallback className="bg-gray-200 text-gray-700 dark:bg-slate-600 dark:text-gray-100 text-lg font-semibold">
+                    {(() => {
+                      const src = getStaffProfilePictureUrl(staffMember as any);
+                      return src ? (
+                        <AvatarImage
+                          src={src}
+                          alt={`${staffMember.firstName} ${staffMember.lastName}`.trim() || "Profile"}
+                          className="object-cover"
+                        />
+                      ) : null;
+                    })()}
+                    <AvatarFallback className="bg-gradient-to-br from-blue-500 to-purple-600 text-white text-lg font-semibold dark:from-blue-600 dark:to-purple-700">
                       {getInitials(staffMember.firstName, staffMember.lastName)}
                     </AvatarFallback>
                   </Avatar>

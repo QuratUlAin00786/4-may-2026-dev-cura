@@ -63,6 +63,12 @@ function isNonBlockingForRebook(status: unknown): boolean {
   return s === "completed" || s === "cancelled" || s === "canceled" || s === "rescheduled";
 }
 
+/** Completed/cancelled/rescheduled must not block new bookings or appear as provider conflicts. */
+function filterBlockingProviderConflicts(rows: any[] | null | undefined): any[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((c) => !isNonBlockingForRebook(c?.status));
+}
+
 import { useToast } from "@/hooks/use-toast";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, getTenantSubdomain } from "@/lib/queryClient";
@@ -1219,7 +1225,7 @@ const parseShiftTimeToMinutes = (time?: string): number => {
       if (autoResolvedProviderConflictRef.current[key]) return false;
       autoResolvedProviderConflictRef.current[key] = true;
 
-      const conflicts = Array.isArray(opts.conflicts) ? opts.conflicts : [];
+      const conflicts = filterBlockingProviderConflicts(Array.isArray(opts.conflicts) ? opts.conflicts : []);
       const blocking = conflicts
         .map((c: any) => ({
           id: Number(c?.id ?? c?.appointment_id ?? c?.appointmentId),
@@ -1254,6 +1260,7 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     const patientId = Number(payload?.patientId);
     const providerId = Number(payload?.providerId);
     const scheduledAt = String(payload?.scheduledAt || "");
+    const duration = payload?.duration != null && Number(payload.duration) > 0 ? Number(payload.duration) : 30;
     if (!patientId || !providerId || !scheduledAt) return [];
 
     try {
@@ -1261,21 +1268,24 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         patientId,
         providerId,
         scheduledAt,
+        duration,
       });
       const data = await res.json();
       const providerConflict = Array.isArray(data?.providerConflict) ? data.providerConflict : [];
-      // Map server rows to our conflict shape
-      return providerConflict.map((c: any) => ({
-        id: c.id ?? c.appointment_id,
-        appointmentId: c.appointmentId ?? c.appointment_id,
-        scheduledAt: c.scheduledAt ?? c.scheduled_at,
-        duration: c.duration,
-        status: c.status,
-        title: c.title,
-        patientId: c.patientId ?? c.patient_id,
-        providerId: c.providerId ?? c.provider_id,
-        createdBy: c.createdBy ?? c.created_by,
-      }));
+      // Map server rows to our conflict shape; omit completed/cancelled/rescheduled.
+      return filterBlockingProviderConflicts(
+        providerConflict.map((c: any) => ({
+          id: c.id ?? c.appointment_id,
+          appointmentId: c.appointmentId ?? c.appointment_id,
+          scheduledAt: c.scheduledAt ?? c.scheduled_at,
+          duration: c.duration,
+          status: c.status,
+          title: c.title,
+          patientId: c.patientId ?? c.patient_id,
+          providerId: c.providerId ?? c.provider_id,
+          createdBy: c.createdBy ?? c.created_by,
+        })),
+      );
     } catch {
       return [];
     }
@@ -2980,23 +2990,26 @@ Medical License: [License Number]
     if (providerTimeConflicts.length > 0) return;
     if (!pendingCreateAppointmentPayload?.providerId || !pendingCreateAppointmentPayload?.scheduledAt) return;
 
-    const inferred = buildLocalProviderConflicts({
-      providerId: Number(pendingCreateAppointmentPayload.providerId),
-      scheduledAt: String(pendingCreateAppointmentPayload.scheduledAt || ""),
-      duration: pendingCreateAppointmentPayload.duration,
-      appointmentsList: appointments,
-    });
+    const inferred = filterBlockingProviderConflicts(
+      buildLocalProviderConflicts({
+        providerId: Number(pendingCreateAppointmentPayload.providerId),
+        scheduledAt: String(pendingCreateAppointmentPayload.scheduledAt || ""),
+        duration: pendingCreateAppointmentPayload.duration,
+        appointmentsList: appointments,
+      }),
+    );
     if (inferred.length > 0) {
       setProviderTimeConflicts(inferred);
       return;
     }
 
-    // If we couldn't infer locally (even though we have appointments loaded),
-    // ask the backend check-conflicts endpoint for the exact conflicting appointment(s).
     (async () => {
       const serverConflicts = await fetchConflictDetailsFromServer(pendingCreateAppointmentPayload);
       if (serverConflicts.length > 0) {
         setProviderTimeConflicts(serverConflicts);
+      } else {
+        setShowProviderTimeConflict(false);
+        setPendingCreateAppointmentPayload(null);
       }
     })();
   }, [
@@ -5017,7 +5030,10 @@ Medical License: [License Number]
                       ) : (
                         <div className="grid grid-cols-2 gap-2">
                           {timeSlots.map((slot) => {
-                            const isAvailable = isTimeSlotAvailable(newAppointmentDate, slot);
+                            const validationForSlot =
+                              newAppointmentDate &&
+                              checkConsecutiveSlotsAvailable(newAppointmentDate, slot, selectedDuration);
+                            const isAvailable = Boolean(validationForSlot?.available);
                             const isSelected = newSelectedTimeSlot === slot;
                             
                             return (
@@ -5226,8 +5242,11 @@ Medical License: [License Number]
                     <Label className="text-sm font-medium text-gray-600 mb-2 block">Select Time Slot</Label>
                     <div className="border rounded-lg p-3 bg-gray-50 h-[320px] overflow-y-auto">
                       <div className="grid grid-cols-2 gap-2">
-                        {timeSlots.map((slot) => {
-                          const isAvailable = newAppointmentDate ? isTimeSlotAvailable(newAppointmentDate, slot) : true;
+                          {timeSlots.map((slot) => {
+                            const validationForSlot =
+                              newAppointmentDate &&
+                              checkConsecutiveSlotsAvailable(newAppointmentDate, slot, selectedDuration);
+                            const isAvailable = newAppointmentDate ? Boolean(validationForSlot?.available) : true;
                           const isSelected = newSelectedTimeSlot === slot;
                           
                           return (
@@ -6230,12 +6249,14 @@ Medical License: [License Number]
                           if (Array.isArray(payload)) {
                             const providerIdNum = parseInt(selectedProviderId);
                             const durationNum = Number(selectedDuration || 30);
-                            const inferred = buildLocalProviderConflicts({
-                              providerId: providerIdNum,
-                              scheduledAt: newScheduledAt,
-                              duration: durationNum,
-                              appointmentsList: payload,
-                            });
+                            const inferred = filterBlockingProviderConflicts(
+                              buildLocalProviderConflicts({
+                                providerId: providerIdNum,
+                                scheduledAt: newScheduledAt,
+                                duration: durationNum,
+                                appointmentsList: payload,
+                              }),
+                            );
                             const pendingPayload = {
                               patientId: parseInt(newAppointmentData.patientId),
                               providerId: parseInt(selectedProviderId),
@@ -6253,6 +6274,16 @@ Medical License: [License Number]
                               description: "",
                               createdBy: user?.id,
                             };
+                            if (inferred.length === 0) {
+                              toast({
+                                title: "Unable to book",
+                                description:
+                                  "The server reported a conflict, but there is no active overlapping appointment (completed/cancelled slots do not count). Refresh the calendar and try again.",
+                                variant: "destructive",
+                              });
+                              setShowConfirmationDialog(false);
+                              return;
+                            }
                             setPendingCreateAppointmentPayload(pendingPayload);
                             setProviderTimeConflicts(inferred);
                             setShowProviderTimeConflict(true);
@@ -6284,14 +6315,32 @@ Medical License: [License Number]
                               description: "",
                               createdBy: user?.id,
                             };
+                            const mergedAppointmentsList = (() => {
+                              const cached = queryClient.getQueryData<any[]>(["/api/appointments"]);
+                              if (Array.isArray(cached) && cached.length > 0) return cached;
+                              return Array.isArray(appointments) ? appointments : [];
+                            })();
+                            const fallback = filterBlockingProviderConflicts(
+                              buildLocalProviderConflicts({
+                                providerId: parseInt(selectedProviderId),
+                                scheduledAt: newScheduledAt,
+                                duration: selectedDuration,
+                                appointmentsList: mergedAppointmentsList,
+                              }),
+                            );
+                            const fromServer = filterBlockingProviderConflicts(payload.conflicts);
+                            const conflicts = fromServer.length > 0 ? fromServer : fallback;
+                            if (conflicts.length === 0) {
+                              toast({
+                                title: "Unable to book",
+                                description:
+                                  "The server reported a schedule conflict, but no active overlapping appointment was found (completed/cancelled/rescheduled are ignored). Refresh the calendar and try again.",
+                                variant: "destructive",
+                              });
+                              setShowConfirmationDialog(false);
+                              return;
+                            }
                             setPendingCreateAppointmentPayload(pendingPayload);
-                            const fallback = buildLocalProviderConflicts({
-                              providerId: parseInt(selectedProviderId),
-                              scheduledAt: newScheduledAt,
-                              duration: selectedDuration,
-                              appointmentsList: appointments,
-                            });
-                            const conflicts = payload.conflicts.length > 0 ? payload.conflicts : fallback;
                             setProviderTimeConflicts(conflicts);
                             setShowProviderTimeConflict(true);
                             setShowConfirmationDialog(false);
@@ -6371,195 +6420,91 @@ Medical License: [License Number]
         </DialogContent>
       </Dialog>
 
-      {/* Provider Time Conflict Dialog */}
-      <Dialog open={showProviderTimeConflict} onOpenChange={setShowProviderTimeConflict}>
+      {/* Provider time conflict: only opened when providerTimeConflicts.length > 0 (see create onError). */}
+      <Dialog
+        open={showProviderTimeConflict}
+        onOpenChange={(open) => {
+          setShowProviderTimeConflict(open);
+          if (!open) {
+            setProviderTimeConflicts([]);
+            setPendingCreateAppointmentPayload(null);
+          }
+        }}
+      >
         <DialogContent className="max-w-2xl" onInteractOutside={(e) => e.preventDefault()}>
           <DialogHeader>
-            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Unable to book
+            <DialogTitle className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+              {providerTimeConflicts.length > 0
+                ? `Overlapping appointments (${providerTimeConflicts.length})`
+                : "Overlapping appointments"}
             </DialogTitle>
-            <DialogDescription>
-              The selected provider already has overlapping appointment(s) at this time. Update each overlapping
-              appointment to <span className="font-medium">Completed</span> or <span className="font-medium">Cancelled</span> to continue.
+            <DialogDescription className="sr-only">
+              Conflicting appointments for the selected provider and time. Change status on each row if needed.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-3 max-h-[55vh] overflow-y-auto">
-            {providerTimeConflicts.length === 0 ? (
-              <div className="space-y-2">
-                {(() => {
-                  const inferred =
-                    pendingCreateAppointmentPayload?.providerId && pendingCreateAppointmentPayload?.scheduledAt
-                      ? buildLocalProviderConflicts({
-                          providerId: Number(pendingCreateAppointmentPayload?.providerId),
-                          scheduledAt: String(pendingCreateAppointmentPayload?.scheduledAt || ""),
-                          duration: pendingCreateAppointmentPayload?.duration,
-                          appointmentsList: appointments,
-                        })
-                      : [];
-                  if (!inferred || inferred.length === 0) return null;
-                  return (
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
-                        Overlapping appointment(s)
-                      </div>
-                      {inferred.map((c: any) => {
-                        const start = c?.scheduledAt ? parseScheduledAtAsLocal(c.scheduledAt) : null;
-                        const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
-                        const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
-                        const timeLabel =
-                          start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
-                            ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
-                            : "Time unavailable";
-                        const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
-                        const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
-                        const patientName = patient
-                          ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim()
-                          : (c?.patientId ? `Patient ID: ${c.patientId}` : "Patient");
-                        const provider = usersData?.find((u: any) => Number(u.id) === Number(c?.providerId));
-                        const providerName = provider
-                          ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim()
-                          : (c?.providerId ? `Provider ID: ${c.providerId}` : "Provider");
-                        return (
-                          <div
-                            key={String(c?.id ?? apptId)}
-                            className="border rounded-md p-3 bg-gray-50 dark:bg-slate-800/40"
-                          >
-                            <div className="flex items-start justify-between gap-4">
-                              <div className="min-w-0">
-                                <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{apptId}</div>
-                                <div className="text-xs text-gray-700 dark:text-gray-300">{timeLabel}</div>
-                                <div className="text-xs text-gray-700 dark:text-gray-300">Patient: {patientName}</div>
-                                <div className="text-xs text-gray-700 dark:text-gray-300">Provider: {providerName}</div>
-                              </div>
-                              <div className="w-[200px]">
-                                <div className="text-[11px] text-gray-600 dark:text-gray-400 mb-1">Status</div>
-                                <Select
-                                  value={String(c?.status || "scheduled")}
-                                  onValueChange={async (value) => {
-                                    const next = String(value || "").toLowerCase();
-                                    const idNum = Number(c?.id);
-                                    if (!idNum) return;
-                                    await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
-                                    setProviderTimeConflicts((prev) =>
-                                      prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
-                                    );
-                                  }}
-                                >
-                                  <SelectTrigger className="h-8" data-testid={`select-admin-conflict-status-${c?.id}`}>
-                                    <SelectValue placeholder="Select status" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    <SelectItem value="scheduled">Scheduled</SelectItem>
-                                    <SelectItem value="confirmed">Confirmed</SelectItem>
-                                    <SelectItem value="in_progress">In Progress</SelectItem>
-                                    <SelectItem value="completed">Completed</SelectItem>
-                                    <SelectItem value="cancelled">Cancelled</SelectItem>
-                                    <SelectItem value="no_show">No Show</SelectItem>
-                                  </SelectContent>
-                                </Select>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  );
-                })()}
-                <div className="text-sm text-gray-600 dark:text-gray-300">
-                  {pendingCreateAppointmentPayload
-                    ? "No conflict details were returned by the server."
-                    : "No conflict details were returned by the server (missing booking payload)."}
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={async () => {
-                    if (!pendingCreateAppointmentPayload) return;
-                    await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
-                    const fallback = buildLocalProviderConflicts({
-                      providerId: Number(pendingCreateAppointmentPayload?.providerId),
-                      scheduledAt: String(pendingCreateAppointmentPayload?.scheduledAt || ""),
-                      duration: pendingCreateAppointmentPayload?.duration,
-                      appointmentsList: appointments,
-                    });
-                    setProviderTimeConflicts(fallback);
-                  }}
-                >
-                  Refresh & detect conflicts
-                </Button>
-                <div className="text-[11px] text-gray-500 dark:text-gray-400">
-                  Debug: providerId={String(pendingCreateAppointmentPayload?.providerId ?? "—")}, scheduledAt=
-                  {String(pendingCreateAppointmentPayload?.scheduledAt ?? "—")}, duration=
-                  {String(pendingCreateAppointmentPayload?.duration ?? "—")}, loadedAppointments=
-                  {Array.isArray(appointments) ? appointments.length : 0}.
-                </div>
-              </div>
-            ) : (
-              providerTimeConflicts.map((c: any) => {
-                const start = c?.scheduledAt ? parseScheduledAtAsLocal(c.scheduledAt) : null;
-                const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
-                const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
-                const timeLabel =
-                  start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
-                    ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
-                    : "Time unavailable";
-                const resolved = ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase());
-                const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
-                const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
-                const patientName = patient ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim() : (c?.patientId ? `Patient ID: ${c.patientId}` : "Patient");
-                const provider = usersData?.find((u: any) => Number(u.id) === Number(c?.providerId));
-                const providerName = provider ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim() : (c?.providerId ? `Provider ID: ${c.providerId}` : "Provider");
+            {providerTimeConflicts.map((c: any) => {
+              const start = c?.scheduledAt ? parseScheduledAtAsLocal(c.scheduledAt) : null;
+              const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+              const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
+              const timeLabel =
+                start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
+                  ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                  : "—";
+              const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
+              const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
+              const patientName = patient
+                ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim()
+                : (c?.patientId ? `Patient ID: ${c.patientId}` : "—");
+              const provider = usersData?.find((u: any) => Number(u.id) === Number(c?.providerId));
+              const providerName = provider
+                ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim()
+                : (c?.providerId ? `Provider ID: ${c.providerId}` : "—");
 
-                return (
-                  <div key={String(c?.id ?? apptId)} className="border rounded-md p-3 bg-gray-50 dark:bg-slate-800/40">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{apptId}</div>
-                        <div className="text-xs text-gray-700 dark:text-gray-300">{timeLabel}</div>
-                        <div className="text-xs text-gray-700 dark:text-gray-300">Patient: {patientName}</div>
-                        <div className="text-xs text-gray-700 dark:text-gray-300">Provider: {providerName}</div>
-                      </div>
-                      <div className="w-[200px]">
-                        <div className="text-[11px] text-gray-600 dark:text-gray-400 mb-1">Status</div>
-                        <Select
-                          value={String(c?.status || "scheduled")}
-                          onValueChange={async (value) => {
-                            const next = String(value || "").toLowerCase();
-                            const idNum = Number(c?.id);
-                            if (!idNum) return;
-                            await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
-                            setProviderTimeConflicts((prev) =>
-                              prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
-                            );
-                          }}
-                        >
-                          <SelectTrigger className="h-8" data-testid={`select-admin-conflict-status-${c?.id}`}>
-                            <SelectValue placeholder="Select status" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="scheduled">Scheduled</SelectItem>
-                            <SelectItem value="confirmed">Confirmed</SelectItem>
-                            <SelectItem value="in_progress">In Progress</SelectItem>
-                            <SelectItem value="completed">Completed</SelectItem>
-                            <SelectItem value="cancelled">Cancelled</SelectItem>
-                            <SelectItem value="no_show">No Show</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        {updatingConflictAppointmentId === Number(c?.id) && (
-                          <div className="text-[10px] text-gray-500 mt-1">Updating status...</div>
-                        )}
-                        {!resolved && (
-                          <div className="text-[10px] text-rose-600 mt-1">
-                            Must be completed/cancelled to proceed
-                          </div>
-                        )}
-                      </div>
+              return (
+                <div key={String(c?.id ?? apptId)} className="border rounded-md p-3 bg-gray-50 dark:bg-slate-800/40">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{apptId}</div>
+                      <div className="text-xs text-gray-700 dark:text-gray-300">{timeLabel}</div>
+                      <div className="text-xs text-gray-700 dark:text-gray-300">Patient: {patientName}</div>
+                      <div className="text-xs text-gray-700 dark:text-gray-300">Provider: {providerName}</div>
+                    </div>
+                    <div className="w-[200px] shrink-0">
+                      <div className="text-[11px] text-gray-600 dark:text-gray-400 mb-1">Status</div>
+                      <Select
+                        value={String(c?.status || "scheduled")}
+                        onValueChange={async (value) => {
+                          const next = String(value || "").toLowerCase();
+                          const idNum = Number(c?.id);
+                          if (!idNum) return;
+                          await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
+                          setProviderTimeConflicts((prev) =>
+                            prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
+                          );
+                        }}
+                      >
+                        <SelectTrigger className="h-8" data-testid={`select-admin-conflict-status-${c?.id}`}>
+                          <SelectValue placeholder="Select status" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="scheduled">Scheduled</SelectItem>
+                          <SelectItem value="confirmed">Confirmed</SelectItem>
+                          <SelectItem value="in_progress">In Progress</SelectItem>
+                          <SelectItem value="completed">Completed</SelectItem>
+                          <SelectItem value="cancelled">Cancelled</SelectItem>
+                          <SelectItem value="no_show">No Show</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {updatingConflictAppointmentId === Number(c?.id) && (
+                        <div className="text-[10px] text-gray-500 mt-1">Updating…</div>
+                      )}
                     </div>
                   </div>
-                );
-              })
-            )}
+                </div>
+              );
+            })}
           </div>
 
           <DialogFooter className="gap-2">
@@ -6593,7 +6538,7 @@ Medical License: [License Number]
               }
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-60"
             >
-              Continue Booking
+              Continue booking
             </Button>
           </DialogFooter>
         </DialogContent>

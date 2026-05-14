@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Avatar, AvatarContent, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   Dialog,
   DialogContent,
@@ -207,6 +207,23 @@ function getTenantSubdomain(): string {
   }
 
   return 'demo';
+}
+
+function getStaffProfilePictureUrl(staff: { profilePicturePath?: string | null; profile_picture_path?: string | null }): string | null {
+  const raw = staff?.profilePicturePath ?? staff?.profile_picture_path;
+  if (typeof raw !== "string") return null;
+  const t = raw.trim();
+  return t.length > 0 ? t : null;
+}
+
+/** Patient rows often omit profile paths; resolve from linked user (`/api/users`). */
+function getListItemProfilePictureUrl(item: any, usersForAvatars: any[]): string | null {
+  const direct = getStaffProfilePictureUrl(item);
+  if (direct) return direct;
+  const uid = item?.userId ?? item?.user_id;
+  if (uid == null || !Array.isArray(usersForAvatars)) return null;
+  const linked = usersForAvatars.find((u: any) => String(u.id) === String(uid));
+  return getStaffProfilePictureUrl(linked);
 }
 
 function getInitials(firstName: string, lastName: string): string {
@@ -502,6 +519,15 @@ export function DoctorList({
     },
     enabled: isDoctorLike(user?.role),
   });
+
+  const { data: usersForPatientAvatarsData } = useQuery({
+    queryKey: ["/api/users", "doctor-list-patient-avatars"],
+    staleTime: 60000,
+    enabled: isDoctorLike(user?.role),
+  });
+  const usersForPatientAvatars: any[] = Array.isArray(usersForPatientAvatarsData)
+    ? usersForPatientAvatarsData
+    : [];
 
   // Fetch patients for dropdown
   const { data: patients } = useQuery({
@@ -1994,7 +2020,16 @@ export function DoctorList({
             >
               <div className="flex items-start gap-3 w-full">
                 <div className="flex-shrink-0">
-                  <Avatar>
+                  <Avatar className="h-12 w-12">
+                    {(() => {
+                      const src = getListItemProfilePictureUrl(item, usersForPatientAvatars);
+                      return src ? (
+                        <AvatarImage
+                          src={src}
+                          alt={`${String(item.firstName ?? "").trim()} ${String(item.lastName ?? "").trim()}`.trim() || "Staff profile"}
+                        />
+                      ) : null;
+                    })()}
                     <AvatarFallback className="bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-200">
                       {getInitials(item.firstName, item.lastName)}
                     </AvatarFallback>
@@ -2147,9 +2182,14 @@ export function DoctorList({
                       className="bg-white hover:bg-gray-50 border border-gray-200 flex-shrink-0 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-100 dark:hover:bg-slate-600"
                       onClick={(e) => {
                         e.stopPropagation();
-                        const profilePath = isDoctorLike(user?.role)
-                          ? `/${getTenantSubdomain()}/patients/${item.id}`
-                          : `/${getTenantSubdomain()}/staff/${item.id}`;
+                        const subdomain = getTenantSubdomain();
+                        const isPatientRow =
+                          String(item?.role ?? "")
+                            .trim()
+                            .toLowerCase() === "patient";
+                        const profilePath = isPatientRow
+                          ? `/${subdomain}/patients/${item.id}`
+                          : `/${subdomain}/staff/${item.id}`;
                         setLocation(profilePath);
                       }}
                     >

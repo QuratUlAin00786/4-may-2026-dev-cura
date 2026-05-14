@@ -1,4 +1,5 @@
 import { isDoctorLike } from './utils/role-utils.js';
+import { dayBoundsForScheduledInput, parseAppointmentWallClock } from "./appointment-wall-clock.js";
 import { 
   organizations, users, patients, medicalRecords, medicalRecordsFiles, appointments, invoices, payments, aiInsights, subscriptions, patientCommunications, consultations, notifications, prescriptions, documents, medicalImages, clinicalPhotos, labResults, riskAssessments, claims, revenueRecords, insuranceVerifications, clinicalProcedures, emergencyProtocols, medicationsDatabase, roles, staffShifts, doctorDefaultShifts, gdprConsents, gdprDataRequests, gdprAuditTrail, gdprProcessingActivities, conversations as conversationsTable, messages, messageCampaigns, messageTemplates, userConversationFavorites, messageTags, messageTagAssignments, voiceNotes, saasOwners, saasPackages, saasSubscriptions, saasPayments, saasInvoices, saasSettings, chatbotConfigs, chatbotSessions, chatbotMessages, chatbotAnalytics, musclePositions, userDocumentPreferences, letterDrafts, forecastModels, financialForecasts, quickbooksConnections, quickbooksSyncLogs, quickbooksCustomerMappings, quickbooksInvoiceMappings, quickbooksPaymentMappings, quickbooksAccountMappings, quickbooksItemMappings, quickbooksSyncConfigs, doctorsFee, labTestPricing, imagingPricing, treatments, treatmentsInfo, clinicHeaders, clinicFooters, symptomChecks,   forms, formSections, formFields, formShares, formShareLogs, formResponses, formResponseValues, prescriptionShareLogs,
   type Organization, type InsertOrganization,
@@ -220,7 +221,7 @@ export interface IStorage {
   // Appointments
   getAppointment(id: number, organizationId: number): Promise<Appointment | undefined>;
   getAppointmentsByOrganization(organizationId: number, date?: Date): Promise<Appointment[]>;
-  getAppointmentsByProvider(providerId: number, organizationId: number, date?: Date): Promise<Appointment[]>;
+  getAppointmentsByProvider(providerId: number, organizationId: number, date?: Date | string): Promise<Appointment[]>;
   getAppointmentsByPatient(patientId: number, organizationId: number): Promise<Appointment[]>;
   createAppointment(appointment: InsertAppointment): Promise<Appointment>;
   updateAppointment(id: number, organizationId: number, updates: Partial<InsertAppointment>): Promise<Appointment | undefined>;
@@ -1625,23 +1626,27 @@ export class DatabaseStorage implements IStorage {
       .orderBy(asc(appointments.scheduledAt));
   }
 
-  async getAppointmentsByProvider(providerId: number, organizationId: number, date?: Date): Promise<Appointment[]> {
+  async getAppointmentsByProvider(providerId: number, organizationId: number, date?: Date | string): Promise<Appointment[]> {
     let baseConditions = [
       eq(appointments.providerId, providerId),
       eq(appointments.organizationId, organizationId)
     ];
 
-    // If date is provided, filter appointments for that specific date
+    // If date is provided, filter appointments for that specific calendar day (naive / wall-clock).
     if (date) {
-      const startOfDay = new Date(date);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(date);
-      endOfDay.setHours(23, 59, 59, 999);
-      
-      baseConditions.push(
-        gte(appointments.scheduledAt, startOfDay),
-        lte(appointments.scheduledAt, endOfDay)
-      );
+      const bounds = dayBoundsForScheduledInput(date as any);
+      if (bounds) {
+        baseConditions.push(
+          gte(appointments.scheduledAt, bounds.start),
+          lte(appointments.scheduledAt, bounds.end),
+        );
+      } else {
+        const startOfDay = new Date(date as any);
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date(date as any);
+        endOfDay.setHours(23, 59, 59, 999);
+        baseConditions.push(gte(appointments.scheduledAt, startOfDay), lte(appointments.scheduledAt, endOfDay));
+      }
     }
 
     return await db.select().from(appointments)
@@ -1668,8 +1673,8 @@ export class DatabaseStorage implements IStorage {
         appointment.scheduledAt
       );
       
-      // Check for time conflicts
-      const appointmentStart = new Date(appointment.scheduledAt);
+      // Check for time conflicts (use wall-clock parsing so this matches the calendar UI + PG naive timestamps).
+      const appointmentStart = parseAppointmentWallClock(appointment.scheduledAt);
       const appointmentEnd = new Date(appointmentStart.getTime() + (appointment.duration || 30) * 60 * 1000);
       const now = new Date();
       const conflicts = existingAppointments.filter(existing => {
@@ -1682,7 +1687,7 @@ export class DatabaseStorage implements IStorage {
           return false;
         }
         
-        const existingStart = new Date(existing.scheduledAt);
+        const existingStart = parseAppointmentWallClock(existing.scheduledAt);
         const existingEnd = new Date(existingStart.getTime() + (existing.duration || 30) * 60 * 1000);
         // Do not block booking if the existing appointment is currently ongoing.
         // Its status will typically be updated after it finishes.
@@ -1716,8 +1721,11 @@ export class DatabaseStorage implements IStorage {
         const expectedNextId = (maxIdResult[0]?.maxId || 0) + 1;
         console.log(`Sequential validation: Expected next ID: ${expectedNextId}`);
 
-        // Use completely raw SQL to insert appointment without timezone conversion
-        const formattedTimestamp = appointment.scheduledAt.replace('T', ' ');
+        const wallForInsert = parseAppointmentWallClock(appointment.scheduledAt as unknown);
+        if (Number.isNaN(wallForInsert.getTime())) {
+          throw new Error("Invalid scheduledAt for appointment insert");
+        }
+        const formattedTimestamp = `${wallForInsert.getFullYear()}-${String(wallForInsert.getMonth() + 1).padStart(2, "0")}-${String(wallForInsert.getDate()).padStart(2, "0")} ${String(wallForInsert.getHours()).padStart(2, "0")}:${String(wallForInsert.getMinutes()).padStart(2, "0")}:${String(wallForInsert.getSeconds()).padStart(2, "0")}`;
         const created = await tx.execute(sql`
         INSERT INTO appointments (
           organization_id, appointment_id, patient_id, provider_id, assigned_role,

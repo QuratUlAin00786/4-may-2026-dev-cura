@@ -6,13 +6,16 @@
 export function parseAppointmentWallClock(value: unknown): Date {
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) return value;
+    // timestamp without time zone from node-pg: wall-clock digits match UTC getters on the
+    // Date (e.g. DB 15:00 → 2026-05-16T15:00:00.000Z). Local getters would shift on non-UTC
+    // servers and falsely overlap 10:00 with 15:00 (shown as 9:00–10:30 in US timezones).
     return new Date(
-      value.getFullYear(),
-      value.getMonth(),
-      value.getDate(),
-      value.getHours(),
-      value.getMinutes(),
-      value.getSeconds(),
+      value.getUTCFullYear(),
+      value.getUTCMonth(),
+      value.getUTCDate(),
+      value.getUTCHours(),
+      value.getUTCMinutes(),
+      value.getUTCSeconds(),
       0,
     );
   }

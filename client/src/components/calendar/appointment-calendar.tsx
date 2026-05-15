@@ -105,7 +105,17 @@ import { isDoctorLike } from "@/lib/role-utils";
 /** Parse scheduledAt without UTC shift (matches DB naive timestamps used across this calendar). */
 function parseScheduledAtAsLocal(value: string | Date): Date {
   if (value instanceof Date) {
-    return value;
+    if (Number.isNaN(value.getTime())) return value;
+    // Match server + ISO-Z string parsing: wall-clock digits from DB/driver (UTC getters).
+    return new Date(
+      value.getUTCFullYear(),
+      value.getUTCMonth(),
+      value.getUTCDate(),
+      value.getUTCHours(),
+      value.getUTCMinutes(),
+      value.getUTCSeconds(),
+      0,
+    );
   }
   if (typeof value !== "string") {
     return new Date(value as any);
@@ -1427,12 +1437,12 @@ const parseShiftTimeToMinutes = (time?: string): number => {
           createdBy: c.createdBy ?? c.created_by,
         }));
         return filterBlockingProviderConflicts(
-          buildLocalProviderConflicts({
-            providerId,
+          filterAppointmentRowsByWallClockOverlap(
             scheduledAt,
             duration,
-            appointmentsList: mapped,
-          }),
+            mapped,
+            parseScheduledAtAsLocal,
+          ),
         );
       } catch {
         return [];
@@ -1483,12 +1493,12 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         patientConflictRaw,
         parseScheduledAtAsLocal,
       );
-      const providerConflict = buildLocalProviderConflicts({
-        providerId,
+      const providerConflict = filterAppointmentRowsByWallClockOverlap(
         scheduledAt,
         duration,
-        appointmentsList: providerConflictRaw,
-      });
+        providerConflictRaw,
+        parseScheduledAtAsLocal,
+      );
 
       if (patientConflict.length > 0) {
         return {

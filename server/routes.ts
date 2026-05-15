@@ -19,6 +19,7 @@ import { messagingService } from "./messaging-service";
 import { isDoctorLike } from './utils/role-utils.js';
 import {
   filterActiveWallClockConflicts,
+  formatAppointmentScheduledAtForApi,
   mapAppointmentConflictForApi,
   wallClockDateStringFromScheduled,
 } from "./appointment-wall-clock.js";
@@ -7285,7 +7286,8 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         const availabilityData = appointments.map(apt => ({
           id: apt.id,
           providerId: apt.providerId,
-          scheduledAt: apt.scheduledAt,
+          scheduledAt:
+            formatAppointmentScheduledAtForApi(apt.scheduledAt) ?? apt.scheduledAt,
           duration: apt.duration,
           status: apt.status
         }));
@@ -7453,7 +7455,14 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         }
       });
 
+      const withWallClockScheduledAt = (apt: any) => ({
+        ...apt,
+        scheduledAt:
+          formatAppointmentScheduledAtForApi(apt.scheduledAt) ?? apt.scheduledAt,
+      });
+
       const enrichedAppointments = appointments.map(apt => {
+        const aptWithTime = withWallClockScheduledAt(apt);
         // Try to find patient by id first, then by userId (in case patientId is actually a userId)
         let patient = patientMapById.get(apt.patientId);
         if (!patient) {
@@ -7464,7 +7473,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           const name = `${patient.firstName || ''} ${patient.lastName || ''}`.trim();
           if (name) {
           return {
-            ...apt,
+            ...aptWithTime,
               patientName: name
             };
           }
@@ -7476,7 +7485,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           const name = `${user.firstName || ''} ${user.lastName || ''}`.trim();
           if (name) {
         return {
-          ...apt,
+          ...aptWithTime,
               patientName: name
             };
           }
@@ -7486,7 +7495,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         console.warn(`[Appointments] Patient/User not found for appointment ${apt.id}, patientId: ${apt.patientId}. Tried patient.id, patient.userId, and user.id.`);
         // Final fallback - patient record not available or deleted
         return {
-          ...apt,
+          ...aptWithTime,
           patientName: "Patient not found"
         };
       });

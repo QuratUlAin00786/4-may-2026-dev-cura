@@ -8494,38 +8494,28 @@ ${clinicName}`;
               scheduledAt,
             );
 
-            const start = parseAppointmentWallClock(scheduledAt);
-            const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
-            const now = new Date();
+            const conflicts = filterActiveWallClockConflicts(
+              scheduledAt,
+              duration,
+              existingAppointments || [],
+            );
 
-            const normalizeStatus = (raw: any) =>
-              String(raw || "")
-                .trim()
-                .toLowerCase()
-                .replace(/\s+/g, "_");
-            const conflicts = (existingAppointments || []).filter((existing: any) => {
-              const st = normalizeStatus(existing.status);
-              if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
-              const existingStart = parseAppointmentWallClock(existing.scheduledAt);
-              const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
-              if (existingStart <= now && now < existingEnd) return false; // don't block ongoing
-              return start < existingEnd && end > existingStart;
-            });
+            if (conflicts.length === 0) {
+              console.warn(
+                "[APPOINTMENTS] Schedule conflict error but no wall-clock overlap; allowing retry path",
+                { scheduledAt, duration, providerId },
+              );
+              return res.status(409).json({
+                code: "PROVIDER_TIME_CONFLICT",
+                error: error.message,
+                conflicts: [],
+              });
+            }
 
             return res.status(409).json({
               code: "PROVIDER_TIME_CONFLICT",
               error: error.message,
-              conflicts: conflicts.map((c: any) => ({
-                id: c.id,
-                appointmentId: c.appointmentId,
-                scheduledAt: c.scheduledAt,
-                duration: c.duration,
-                status: c.status,
-                title: c.title,
-                patientId: c.patientId,
-                providerId: c.providerId,
-                createdBy: c.createdBy,
-              })),
+              conflicts: conflicts.map((c: any) => mapAppointmentConflictForApi(c)),
             });
           }
         } catch (e) {
@@ -8553,39 +8543,28 @@ ${clinicName}`;
               scheduledAt,
             );
 
-            const start = parseAppointmentWallClock(scheduledAt);
-            const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
-            const now = new Date();
+            const conflicts = filterActiveWallClockConflicts(
+              scheduledAt,
+              duration,
+              existingAppointments || [],
+            );
 
-            const normalizeStatus = (raw: any) =>
-              String(raw || "")
-                .trim()
-                .toLowerCase()
-                .replace(/\s+/g, "_");
-            const conflicts = (existingAppointments || []).filter((existing: any) => {
-              const st = normalizeStatus(existing.status);
-              if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
-              const existingStart = parseAppointmentWallClock(existing.scheduledAt);
-              const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
-              // Do not block booking if the existing appointment is currently ongoing.
-              if (existingStart <= now && now < existingEnd) return false;
-              return start < existingEnd && end > existingStart;
-            });
+            if (conflicts.length === 0) {
+              console.warn(
+                "[APPOINTMENTS] Doctor conflict error but no wall-clock overlap; returning empty conflicts",
+                { scheduledAt, duration, providerId },
+              );
+              return res.status(409).json({
+                code: "PROVIDER_TIME_CONFLICT",
+                error: error.message,
+                conflicts: [],
+              });
+            }
 
             return res.status(409).json({
               code: "PROVIDER_TIME_CONFLICT",
               error: error.message,
-              conflicts: conflicts.map((c: any) => ({
-                id: c.id,
-                appointmentId: c.appointmentId,
-                scheduledAt: c.scheduledAt,
-                duration: c.duration,
-                status: c.status,
-                title: c.title,
-                patientId: c.patientId,
-                providerId: c.providerId,
-                createdBy: c.createdBy,
-              })),
+              conflicts: conflicts.map((c: any) => mapAppointmentConflictForApi(c)),
             });
           }
         } catch (e) {

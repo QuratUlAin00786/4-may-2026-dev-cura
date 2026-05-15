@@ -1330,41 +1330,6 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     [createAppointmentMutation, updateConflictAppointmentStatusMutation, user?.role],
   );
 
-  const fetchConflictDetailsFromServer = useCallback(async (payload: any) => {
-    const patientId = Number(payload?.patientId);
-    const providerId = Number(payload?.providerId);
-    const scheduledAt = String(payload?.scheduledAt || "");
-    const duration = payload?.duration != null && Number(payload.duration) > 0 ? Number(payload.duration) : 30;
-    if (!patientId || !providerId || !scheduledAt) return [];
-
-    try {
-      const res = await apiRequest("POST", "/api/appointments/check-conflicts", {
-        patientId,
-        providerId,
-        scheduledAt,
-        duration,
-      });
-      const data = await res.json();
-      const providerConflict = Array.isArray(data?.providerConflict) ? data.providerConflict : [];
-      // Map server rows to our conflict shape; omit completed/cancelled/rescheduled.
-      return filterBlockingProviderConflicts(
-        providerConflict.map((c: any) => ({
-          id: c.id ?? c.appointment_id,
-          appointmentId: c.appointmentId ?? c.appointment_id,
-          scheduledAt: c.scheduledAt ?? c.scheduled_at,
-          duration: c.duration,
-          status: c.status,
-          title: c.title,
-          patientId: c.patientId ?? c.patient_id,
-          providerId: c.providerId ?? c.provider_id,
-          createdBy: c.createdBy ?? c.created_by,
-        })),
-      );
-    } catch {
-      return [];
-    }
-  }, []);
-
   const buildLocalProviderConflicts = useCallback(
     (opts: {
       providerId: number;
@@ -1429,6 +1394,50 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         }));
     },
     [queryClient],
+  );
+
+  const fetchConflictDetailsFromServer = useCallback(
+    async (payload: any) => {
+      const patientId = Number(payload?.patientId);
+      const providerId = Number(payload?.providerId);
+      const scheduledAt = String(payload?.scheduledAt || "");
+      const duration =
+        payload?.duration != null && Number(payload.duration) > 0 ? Number(payload.duration) : 30;
+      if (!patientId || !providerId || !scheduledAt) return [];
+
+      try {
+        const res = await apiRequest("POST", "/api/appointments/check-conflicts", {
+          patientId,
+          providerId,
+          scheduledAt,
+          duration,
+        });
+        const data = await res.json();
+        const providerConflict = Array.isArray(data?.providerConflict) ? data.providerConflict : [];
+        const mapped = providerConflict.map((c: any) => ({
+          id: c.id ?? c.appointment_id,
+          appointmentId: c.appointmentId ?? c.appointment_id,
+          scheduledAt: c.scheduledAt ?? c.scheduled_at,
+          duration: c.duration,
+          status: c.status,
+          title: c.title,
+          patientId: c.patientId ?? c.patient_id,
+          providerId: c.providerId ?? c.provider_id,
+          createdBy: c.createdBy ?? c.created_by,
+        }));
+        return filterBlockingProviderConflicts(
+          buildLocalProviderConflicts({
+            providerId,
+            scheduledAt,
+            duration,
+            appointmentsList: mapped,
+          }),
+        );
+      } catch {
+        return [];
+      }
+    },
+    [buildLocalProviderConflicts],
   );
 
   // Check for appointment conflicts before creation
@@ -6400,22 +6409,21 @@ Medical License: [License Number]
                               if (Array.isArray(cached) && cached.length > 0) return cached;
                               return Array.isArray(appointments) ? appointments : [];
                             })();
-                            const fallback = filterBlockingProviderConflicts(
+                            const fromServerRows = filterBlockingProviderConflicts(payload.conflicts);
+                            const conflicts = filterBlockingProviderConflicts(
                               buildLocalProviderConflicts({
                                 providerId: parseInt(selectedProviderId),
                                 scheduledAt: newScheduledAt,
                                 duration: selectedDuration,
-                                appointmentsList: mergedAppointmentsList,
+                                appointmentsList:
+                                  fromServerRows.length > 0 ? fromServerRows : mergedAppointmentsList,
                               }),
                             );
-                            const fromServer = filterBlockingProviderConflicts(payload.conflicts);
-                            const conflicts = fromServer.length > 0 ? fromServer : fallback;
                             if (conflicts.length === 0) {
                               toast({
-                                title: "Unable to book",
+                                title: "No time overlap",
                                 description:
-                                  "The server reported a schedule conflict, but no active overlapping appointment was found (completed/cancelled/rescheduled are ignored). Refresh the calendar and try again.",
-                                variant: "destructive",
+                                  "The server reported a conflict, but nothing overlaps your selected time (e.g. 10:00 AM vs 3:00 PM). Refresh the page and try again — if this persists, the server needs the latest appointment fix deployed.",
                               });
                               setShowConfirmationDialog(false);
                               return;

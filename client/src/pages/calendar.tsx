@@ -6687,7 +6687,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                               const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
                               const timeLabel =
                                 start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
-                                  ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                                  ? `${format(start, "EEEE, MMM d, yyyy")} · ${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
                                   : "Time unavailable";
                               const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
                               const patientName =
@@ -6771,7 +6771,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                                 const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
                                 const timeLabel =
                                   start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
-                                    ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                                    ? `${format(start, "EEEE, MMM d, yyyy")} · ${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
                                     : "Time unavailable";
                                 const patient =
                                   patients?.find((p: any) => Number(p.id) === Number(n?.patientId));

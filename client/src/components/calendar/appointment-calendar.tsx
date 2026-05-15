@@ -6582,7 +6582,7 @@ Medical License: [License Number]
               const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
               const timeLabel =
                 start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
-                  ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                  ? `${format(start, "EEEE, MMM d, yyyy")} · ${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
                   : "—";
               const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
               const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
